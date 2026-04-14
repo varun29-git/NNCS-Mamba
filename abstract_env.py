@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 import numpy as np
 from typing import Any, List, Tuple
 
+# ------------------------------------------------------------------------------
+
 class Plant(ABC):
     """
     Abstract Base Class for a Continuous-Time System (Plant).
@@ -37,6 +39,8 @@ class Plant(ABC):
         """
         pass
 
+# ------------------------------------------------------------------------------
+
 class ExpertController(ABC):
     """
     Abstract Base Class for the Nominal Controller (Teacher).
@@ -67,6 +71,10 @@ class ExpertController(ABC):
             np.ndarray: The optimal control input u.
         """
         pass
+
+
+# ------------------------------------------------------------------------------
+
 
 class LearnerController(ABC):
     """
@@ -109,3 +117,6 @@ class LearnerController(ABC):
             Any: Training metrics (e.g., loss values).
         """
         pass
+
+# ------------------------------------------------------------------------------
+
