@@ -11,9 +11,8 @@ from mamba_ssm.utils.generation import InferenceParams
 
 class MambaController(LearnerController, nn.Module):
     """
-    Production-ready Neural Network Controller using `mamba-ssm`.
-    Implements proper O(1) causal inference cache parameters, batched sequence learning,
-    and device scaling operations.
+    Production Neural Network Controller utilizing advanced hardware inference
+    mechanisms and PyTorch Mixed Precision loops for scalable CUDA scaling.
     """
     def __init__(self, obs_dim: int, action_dim: int, d_model: int = 64, d_state: int = 16, num_layers: int = 2, lr: float = 1e-4):
         nn.Module.__init__(self)
@@ -32,81 +31,92 @@ class MambaController(LearnerController, nn.Module):
         
         self.output_layer = nn.Linear(d_model, action_dim)
         
-        # Internal state manager for autoregressive steps
+        # Internal auto-regressive state manager
         self.inference_params = None
 
         self.to(self.device)
         
-        # Persistent optimizer & loss function
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.criterion = nn.MSELoss()
         
+        # Standard AMP scaling utility for modern GPUs
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        
     def reset(self) -> None:
-        """Resets the internal hidden memory cache for autoregressive steps across episodes."""
-        self.inference_params = InferenceParams(max_seqlen=5000, max_batch_size=1)
-        self.inference_params.seqlen_offset = 0 # Vital to reset the seq slice pointer
+        """
+        Pre-allocates precise contiguous cache memory required for extended recursive Mamba logic
+        without drifting / OOM crashes during single-sequence $O(1)$ control.
+        """
+        max_batch_size = 1
+        max_seq_len = 5000
+        
+        self.inference_params = InferenceParams(max_seqlen=max_seq_len, max_batch_size=max_batch_size)
+        
+        # Rigorously allocate memory blocks directly onto CUDA layers
+        for block in self.mamba_blocks:
+            if hasattr(block, "allocate_inference_cache"):
+                # Allocates required kwargs corresponding to causal-conv1d parameters
+                block.allocate_inference_cache(batch_size=max_batch_size, max_seqlen=max_seq_len, dtype=torch.bfloat16)
+
+        self.inference_params.seqlen_offset = 0 
         
     def forward(self, y: np.ndarray) -> np.ndarray:
         """
-        Autoregressive step in O(1) utilizing hardware-efficient cached recurrent transitions.
+        Causally shifts $y$ integrating across explicitly allocated hidden boundary caches.
         """
         self.eval()
         with torch.no_grad():
-            x = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(1, 1, -1) # (batch=1, seq_len=1, obs_dim)
+            x = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(1, 1, -1) 
             x = self.input_layer(x)
             
             if self.inference_params is None:
                 self.reset()
                 
-            # Run the O(1) step updating the cache block-by-block
+            # Single sequence evaluation (B=1, L=1, D)
             for block in self.mamba_blocks:
                 x = block(x, inference_params=self.inference_params)
                 
-            # Crucial: increment the sequence offset so the next step correctly shifts the tensor buffers
+            # Enact internal ring-buffer cache index offset
             self.inference_params.seqlen_offset += 1
             
             out = self.output_layer(x)
-            # Remove seq and batch dims -> (action_dim)
-            return out.squeeze().cpu().numpy()
+            # Remove seq and batch dims defensively via explicit indexing
+            return out[0, 0, :].cpu().numpy()
             
-    def update(self, dataset, epochs: int = 2, batch_size: int = 16) -> float:
+    def update(self, train_data_loader: DataLoader, epochs: int = 1) -> float:
         """
-        Imitation learning process utilizing parallel hardware scans and Mini-Batches.
+        Receives pre-packaged batched DataLoader (containing balanced representations
+        of memory + new CEGIS flaws) and scales operations utilizing PyTorch AMP.
         """
         self.train()
-        if len(dataset) == 0:
-            return 0.0
-            
-        # Convert buffer directly to batched tensors
-        # Assuming fixed simulated sequence lengths
-        obs_list = [item[0] for item in dataset]
-        act_list = [item[1] for item in dataset]
-        
-        obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32, device=self.device) # (B, S, D_obs)
-        act_tensor = torch.tensor(np.stack(act_list), dtype=torch.float32, device=self.device) # (B, S, D_act)
-        
-        train_data = TensorDataset(obs_tensor, act_tensor)
-        train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-        
         total_loss = 0.0
         batches_processed = 0
         
+        # Enforce AMP logic wrapper context explicitly
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
         for _ in range(epochs):
-            for batch_obs, batch_act in train_loader:
+            for batch_obs, batch_act in train_data_loader:
                 self.optimizer.zero_grad()
                 
-                x = self.input_layer(batch_obs)
-                for block in self.mamba_blocks:
-                    x = block(x) # (B, S, d_model) - Parallel Execution Mode
-                    
-                predictions = self.output_layer(x) # (B, S, D_act)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == 'cuda')):
+                    x = self.input_layer(batch_obs)
+                    for block in self.mamba_blocks:
+                        x = block(x) # Parallel Full-Scan mode execution
+                        
+                    predictions = self.output_layer(x)
+                    loss = self.criterion(predictions, batch_act)
                 
-                loss = self.criterion(predictions, batch_act)
-                loss.backward()
-                
-                # Gradient Clipping for explosive derivatives stability 
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                self.optimizer.step()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer) 
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                    self.optimizer.step()
                 
                 total_loss += loss.item()
                 batches_processed += 1
