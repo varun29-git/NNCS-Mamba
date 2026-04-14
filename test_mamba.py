@@ -1,5 +1,5 @@
 import numpy as np
-from mamba_controller import MambaController
+from mamba_learner import MambaController
 
 def test_mamba_training():
     obs_dim = 3

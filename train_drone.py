@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from drone_env import DronePlant, DroneExpertController
-from mamba_controller import MambaController
+from mamba_learner import MambaController
 
 def evaluate_drone():
     # 12D observation space, 4D continuous action

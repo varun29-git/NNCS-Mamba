@@ -4,7 +4,7 @@ from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
-from mamba_controller import MambaController
+from mamba_learner import MambaController
 
 
 def _suffix_eventually(signal: np.ndarray) -> np.ndarray:

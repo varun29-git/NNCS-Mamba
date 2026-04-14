@@ -40,7 +40,7 @@ class ProportionalExpert(ExpertController):
         return -self.Kp @ y
 
 if __name__ == "__main__":
-    from mamba_controller import MambaController
+    from mamba_learner import MambaController
     
     plant = SimpleLinearPlant()
     expert = ProportionalExpert()
