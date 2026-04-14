@@ -6,7 +6,7 @@ This repository implements a framework to synthesize Neural Network Control Syst
 
 - **12D Drone Plant Simulation (`drone_env.py`)**: A continuous drone simulation evaluating aggressive 3D docking maneuvers, incorporating hidden mathematical dynamics (unobservable periodic wind gusts) designed to force recurrent memory usage.
 - **Sequential Expert Controller (`drone_env.py`)**: A robust algorithmic demonstrator that perfectly executes sequential logic pathways (visiting a Pre-Dock coordinate before descending to the absolute Origin), generating flawless reference trajectories.
-- **Mamba SSM Controller (`mamba_learner.py`)**: A neural controller integrating `mamba-ssm`. It achieves native parallel scan scaling during trajectory training sequences and shifts to constant $O(1)$ recurrent sequence processing using `InferenceParams` during online tracking. 
+- **Mamba SSM Learner (`mamba_learner.py`)**: A neural learner/student policy integrating `mamba-ssm`. It learns from expert controller demonstrations, trains with native parallel scan scaling over trajectory sequences, and shifts to constant $O(1)$ recurrent sequence processing using `InferenceParams` during online rollout. 
 - **Automated CEGIS Loop (`cegis_loop.py`)**: A discrete programmatic iteration script that pits a Temporal Logic Falsifier against the neural model, structurally isolating edge-cases to iteratively synthesize a perfectly stable control policy.
 
 ## The Operational Workflow 
