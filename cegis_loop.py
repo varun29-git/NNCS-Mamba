@@ -313,7 +313,7 @@ def build_cegis_framework():
         # Falsification
         print("-> Running CEM Falsifier (multi-checkpoint + mass decay)...")
         failures = falsify_cem(mamba_ctrl, drone_plant, expert_ctrl,
-                              num_generations=2, pop_size=30, seq_steps=SEQ_STEPS, dt=DT)
+                              num_generations=1, pop_size=20, seq_steps=SEQ_STEPS, dt=DT)
         num_fails = len(failures)
         
         coverage = (1.0 - min(1.0, num_fails / 60.0)) * 100

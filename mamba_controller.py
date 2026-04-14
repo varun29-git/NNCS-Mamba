@@ -29,6 +29,9 @@ class MambaController(LearnerController, nn.Module):
             Mamba(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
             for _ in range(num_layers)
         ])
+        self.norms = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(num_layers)
+        ])
         
         self.output_layer = nn.Linear(d_model, action_dim)
         
@@ -41,10 +44,10 @@ class MambaController(LearnerController, nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.criterion = nn.MSELoss()
         
-    def reset(self) -> None:
+    def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
         """Resets the internal hidden memory cache for autoregressive steps across episodes."""
-        self.inference_params = InferenceParams(max_seqlen=5000, max_batch_size=1)
-        self.inference_params.seqlen_offset = 0 # Vital to reset the seq slice pointer
+        self.inference_params = InferenceParams(max_seqlen=max_seq_len, max_batch_size=max_batch_size)
+        self.inference_params.seqlen_offset = 0
         
     def forward(self, y: np.ndarray) -> np.ndarray:
         """
@@ -59,15 +62,14 @@ class MambaController(LearnerController, nn.Module):
                 self.reset()
                 
             # Run the O(1) step updating the cache block-by-block
-            for block in self.mamba_blocks:
-                x = block(x, inference_params=self.inference_params)
+            for block, norm in zip(self.mamba_blocks, self.norms):
+                x = x + block(norm(x), inference_params=self.inference_params)
                 
             # Crucial: increment the sequence offset so the next step correctly shifts the tensor buffers
             self.inference_params.seqlen_offset += 1
             
             out = self.output_layer(x)
-            # Remove seq and batch dims -> (action_dim)
-            return out.squeeze().cpu().numpy()
+            return np.clip(out[0, 0, :].cpu().numpy(), -20.0, 20.0)
             
     def update(self, dataset, epochs: int = 2, batch_size: int = 16) -> float:
         """
@@ -96,8 +98,8 @@ class MambaController(LearnerController, nn.Module):
                 self.optimizer.zero_grad()
                 
                 x = self.input_layer(batch_obs)
-                for block in self.mamba_blocks:
-                    x = block(x) # (B, S, d_model) - Parallel Execution Mode
+                for block, norm in zip(self.mamba_blocks, self.norms):
+                    x = x + block(norm(x))
                     
                 predictions = self.output_layer(x) # (B, S, D_act)
                 

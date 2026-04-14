@@ -82,8 +82,8 @@ class DronePlant(Plant):
         dvy = -self.gravity * phi + ay_cmd
         dvz = az_cmd
         
-        dp = -10.0 * phi
-        dq = -10.0 * theta
+        dp = -10.0 * phi - 2.0 * p
+        dq = -10.0 * theta - 2.0 * q
         dr = yaw_rate_cmd
         
         # Process noise (aerodynamic turbulence, IMU jitter)
