@@ -7,91 +7,102 @@ from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT
 from mamba_controller import MambaController
 
 
-def check_stl_score(trajectory_y, s_ov=25.0, s_st=2.0) -> float:
-    """
-    Evaluates a trajectory against the full multi-checkpoint PSTL specification:
-    
-    1. SAFETY: Position distance from origin < s_ov at all times, attitude < 1.0 rad
-    2. SEQUENTIAL VISITS: Must pass within 2.0 of A, then B, then C, in order
-    3. TERMINAL STABILIZATION: Eventually always within s_st of origin, velocity < 0.5
-    
-    Returns a continuous robustness margin (positive = pass, negative = fail).
-    """
-    min_safety_margin = float('inf')
-    
-    # ------------------------------------------------------------------
-    # RULE 1: GLOBAL SAFETY ENVELOPE (overshoot + attitude)
-    # ------------------------------------------------------------------
-    for y in trajectory_y:
-        dist = np.linalg.norm(y[0:3])
-        roll, pitch = y[3], y[4]
-        
-        dist_margin = s_ov - dist
-        roll_margin = 1.0 - abs(roll)
-        pitch_margin = 1.0 - abs(pitch)
-        
-        margin = min(dist_margin, roll_margin, pitch_margin)
-        if margin < min_safety_margin:
-            min_safety_margin = margin
-    
-    # ------------------------------------------------------------------
-    # RULE 2: SEQUENTIAL CHECKPOINT VISITS (A → B → C)
-    # The trajectory must pass within visit_radius of each checkpoint IN ORDER.
-    # ------------------------------------------------------------------
-    visit_radius = 2.0
-    checkpoints_to_visit = CHECKPOINTS[:3]  # A, B, C (not dock)
-    next_checkpoint_idx = 0
-    
-    for y in trajectory_y:
-        if next_checkpoint_idx >= len(checkpoints_to_visit):
-            break  # All visited
-        target = checkpoints_to_visit[next_checkpoint_idx]
-        dist_to_target = np.linalg.norm(y[0:3] - target)
-        if dist_to_target < visit_radius:
-            next_checkpoint_idx += 1
-    
-    # Penalize proportionally for each unvisited checkpoint
-    unvisited = len(checkpoints_to_visit) - next_checkpoint_idx
-    if unvisited > 0:
-        # Each unvisited checkpoint contributes a negative penalty
-        # Scale: closest approach to the next unvisited checkpoint
-        if next_checkpoint_idx < len(checkpoints_to_visit):
-            next_target = checkpoints_to_visit[next_checkpoint_idx]
-            closest = min(np.linalg.norm(y[0:3] - next_target) for y in trajectory_y)
-            checkpoint_margin = visit_radius - closest  # negative if never got close
-        else:
-            checkpoint_margin = 0.0
-        # Weight unvisited checkpoints heavily
-        checkpoint_penalty = checkpoint_margin - (unvisited * 5.0)
-        min_safety_margin = min(min_safety_margin, checkpoint_penalty)
-    
-    # ------------------------------------------------------------------
-    # RULE 3: EVENTUALLY ALWAYS STABILIZATION AT DOCK
-    # ------------------------------------------------------------------
-    entered_step = -1
-    for i, y in enumerate(trajectory_y):
-        dist = np.linalg.norm(y[0:3])
-        vel = np.linalg.norm(y[6:9])
-        if dist < s_st and vel < 0.5:
-            entered_step = i
-            break
-            
-    if entered_step != -1:
-        for y in trajectory_y[entered_step:]:
-            dist = np.linalg.norm(y[0:3])
-            vel = np.linalg.norm(y[6:9])
-            margin = min(s_st - dist, 0.5 - vel)
-            if margin < 0:
-                if margin < min_safety_margin:
-                    min_safety_margin = margin
-    else:
-        # Never stabilized — penalty based on closest approach
-        dists = [np.linalg.norm(y[0:3]) for y in trajectory_y]
-        min_dist = min(dists)
-        stab_margin = s_st - min_dist
-        min_safety_margin = min(min_safety_margin, stab_margin)
+def _suffix_eventually(signal: np.ndarray) -> np.ndarray:
+    """Robustness of F phi from every time index onward."""
+    out = np.empty_like(signal)
+    best = -np.inf
+    for idx in range(len(signal) - 1, -1, -1):
+        best = max(best, signal[idx])
+        out[idx] = best
+    return out
 
-    return min_safety_margin
+
+def _suffix_always(signal: np.ndarray) -> np.ndarray:
+    """Robustness of G phi from every time index onward."""
+    out = np.empty_like(signal)
+    worst = np.inf
+    for idx in range(len(signal) - 1, -1, -1):
+        worst = min(worst, signal[idx])
+        out[idx] = worst
+    return out
+
+
+def _bounded_suffix_eventually(signal: np.ndarray, latest_idx: int) -> float:
+    """Robustness of F_[0, latest_idx] phi at the initial time."""
+    if len(signal) == 0:
+        return -np.inf
+    capped_idx = min(len(signal) - 1, latest_idx)
+    return float(np.max(signal[:capped_idx + 1]))
+
+
+def _sequential_visit_robustness(visit_signals, latest_indices=None) -> float:
+    """
+    Robustness of the nested formula:
+        F visit_A AND F visit_B AND F visit_C in order,
+    implemented as F(A AND F(B AND F C)) in discrete time.
+
+    When latest_indices is provided, each visit must happen by that absolute index.
+    """
+    if not visit_signals:
+        return -np.inf
+
+    if latest_indices is None:
+        nested = visit_signals[-1]
+        for signal in reversed(visit_signals[:-1]):
+            nested = np.minimum(signal, _suffix_eventually(nested))
+        return float(np.max(nested))
+
+    if len(latest_indices) != len(visit_signals):
+        raise ValueError("latest_indices must match the number of visit signals")
+
+    nested_value = _bounded_suffix_eventually(visit_signals[-1], latest_indices[-1])
+    for signal, latest_idx in zip(reversed(visit_signals[:-1]), reversed(latest_indices[:-1])):
+        capped_idx = min(len(signal) - 1, latest_idx)
+        candidates = np.minimum(signal[:capped_idx + 1], nested_value)
+        nested_value = float(np.max(candidates)) if len(candidates) > 0 else -np.inf
+    return nested_value
+
+
+def check_stl_score(trajectory_y, s_ov=25.0, s_st=2.0, checkpoint_deadlines=None) -> float:
+    """
+    Evaluates a trajectory with discrete-time STL-style robustness:
+
+    1. G safety: position distance from origin < s_ov and |roll|, |pitch| < 1.0
+    2. F(A and F(B and F(C))) with optional absolute time deadlines
+    3. F G docked: eventually always within s_st of origin and speed < 0.5
+
+    Returns a continuous robustness degree (positive = satisfied, negative = violated).
+    """
+    trajectory_y = np.asarray(trajectory_y)
+    positions = trajectory_y[:, 0:3]
+    rolls = trajectory_y[:, 3]
+    pitches = trajectory_y[:, 4]
+    speeds = np.linalg.norm(trajectory_y[:, 6:9], axis=1)
+
+    safety_signal = np.minimum.reduce([
+        s_ov - np.linalg.norm(positions, axis=1),
+        1.0 - np.abs(rolls),
+        1.0 - np.abs(pitches),
+    ])
+    safety_robustness = float(np.min(safety_signal))
+
+    visit_radius = 2.0
+    visit_signals = [
+        visit_radius - np.linalg.norm(positions - checkpoint, axis=1)
+        for checkpoint in CHECKPOINTS[:3]
+    ]
+    sequential_robustness = _sequential_visit_robustness(
+        visit_signals,
+        latest_indices=checkpoint_deadlines,
+    )
+
+    dock_signal = np.minimum(
+        s_st - np.linalg.norm(positions, axis=1),
+        0.5 - speeds,
+    )
+    stabilization_robustness = float(np.max(_suffix_always(dock_signal)))
+
+    return min(safety_robustness, sequential_robustness, stabilization_robustness)
 
 
 def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_comparison.png"):
