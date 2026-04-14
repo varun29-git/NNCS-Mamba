@@ -51,12 +51,19 @@ class MambaController(LearnerController, nn.Module):
         max_seq_len = 5000
         
         self.inference_params = InferenceParams(max_seqlen=max_seq_len, max_batch_size=max_batch_size)
+        self.inference_params.key_value_memory_dict = {}
         
-        # Rigorously allocate memory blocks directly onto CUDA layers
-        for block in self.mamba_blocks:
+        # Rigorously allocate memory blocks directly onto CUDA layers resolving Tensor dimension leaks
+        for i, block in enumerate(self.mamba_blocks):
             if hasattr(block, "allocate_inference_cache"):
-                # Allocates required kwargs corresponding to causal-conv1d parameters
-                block.allocate_inference_cache(batch_size=max_batch_size, max_seqlen=max_seq_len, dtype=torch.bfloat16)
+                # Native datatype extraction ensuring Mamba inference dtype matches PyTorch params
+                cache = block.allocate_inference_cache(
+                    batch_size=max_batch_size, 
+                    max_seqlen=max_seq_len, 
+                    dtype=next(self.parameters()).dtype,
+                    device=self.device
+                )
+                self.inference_params.key_value_memory_dict[i] = cache
 
         self.inference_params.seqlen_offset = 0 
         
@@ -73,7 +80,7 @@ class MambaController(LearnerController, nn.Module):
                 self.reset()
                 
             # Single sequence evaluation (B=1, L=1, D)
-            for block in self.mamba_blocks:
+            for i, block in enumerate(self.mamba_blocks):
                 x = block(x, inference_params=self.inference_params)
                 
             # Enact internal ring-buffer cache index offset
@@ -83,13 +90,13 @@ class MambaController(LearnerController, nn.Module):
             # Remove seq and batch dims defensively via explicit indexing
             return out[0, 0, :].cpu().numpy()
             
-    def update(self, train_data_loader: DataLoader, epochs: int = 1) -> float:
+    def update(self, train_data_loader: DataLoader, val_data_loader: DataLoader = None, epochs: int = 1) -> Tuple[float, float]:
         """
-        Receives pre-packaged batched DataLoader (containing balanced representations
-        of memory + new CEGIS flaws) and scales operations utilizing PyTorch AMP.
+        Receives pre-packaged batched DataLoader datasets integrating proper validation checks 
+        to track Mamba generalizability vs Overfitting index matrices.
         """
         self.train()
-        total_loss = 0.0
+        total_train_loss = 0.0
         batches_processed = 0
         
         # Enforce AMP logic wrapper context explicitly
@@ -99,7 +106,8 @@ class MambaController(LearnerController, nn.Module):
             for batch_obs, batch_act in train_data_loader:
                 self.optimizer.zero_grad()
                 
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=(device_type == 'cuda')):
+                # Defaulting to float16 prevents compatibility crashes on older architectures
+                with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=(device_type == 'cuda')):
                     x = self.input_layer(batch_obs)
                     for block in self.mamba_blocks:
                         x = block(x) # Parallel Full-Scan mode execution
@@ -118,7 +126,27 @@ class MambaController(LearnerController, nn.Module):
                     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                     self.optimizer.step()
                 
-                total_loss += loss.item()
+                total_train_loss += loss.item()
                 batches_processed += 1
                 
-        return total_loss / max(1, batches_processed)
+        avg_train_loss = total_train_loss / max(1, batches_processed)
+        
+        avg_val_loss = 0.0
+        # Formal offline Validation Matrix
+        if val_data_loader is not None and len(val_data_loader) > 0:
+            self.eval()
+            val_loss_sum = 0.0
+            val_batches = 0
+            with torch.no_grad():
+                for v_obs, v_act in val_data_loader:
+                    with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=(device_type == 'cuda')):
+                        x = self.input_layer(v_obs)
+                        for block in self.mamba_blocks:
+                            x = block(x)
+                        preds = self.output_layer(x)
+                        v_loss = self.criterion(preds, v_act)
+                    val_loss_sum += v_loss.item()
+                    val_batches += 1
+            avg_val_loss = val_loss_sum / max(1, val_batches)
+            
+        return avg_train_loss, avg_val_loss
