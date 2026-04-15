@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
-import matplotlib.pyplot as plt
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
 from mamba_learner import MambaController
 
@@ -109,6 +108,8 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     """
     Enhanced 4-panel trajectory comparison with checkpoint markers.
     """
+    import matplotlib.pyplot as plt
+
     mamba_pos = np.array([y[0:3] for y in mamba_traj])
     expert_pos = np.array([y[0:3] for y in expert_traj])
     
