@@ -1,468 +1,271 @@
+"""
+Master Training Pipeline for NNCS-Mamba
+
+Usage Examples:
+1. Smoke Test (Fast check):
+   python train.py --phase smoke --outdir runs/smoke
+
+2. Baseline Imitation (The heavy lifting):
+   python train.py --phase imitation --num-traj 5000 --batch-size 32 --outdir runs/imitation
+
+3. CEGIS Refinement (Hunting edge cases):
+   python train.py --phase cegis --resume runs/imitation/best_imitation.pt --cegis-cycles 20
+
+4. Full Pipeline (Imitation → CEGIS, one command):
+   python train.py --phase all --outdir runs/full
+"""
+
 import argparse
 import json
-from collections import deque
-from pathlib import Path
-import time
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
+from pathlib import Path
+from collections import deque
+from torch.utils.data import DataLoader, TensorDataset
 
-from cegis_loop import (
-    falsify_cem,
-    fix_and_merge,
-    generate_expert_demonstrations,
-    prepare_dataloaders,
-    run_validation_rollouts,
-)
-from drone_env import DroneExpertController, DronePlant
+from drone_env import DronePlant, DroneExpertController
 from mamba_learner import MambaController
+from cegis_loop import falsify_cem, fix_and_merge
 
 
-DatasetType = List[Tuple[np.ndarray, np.ndarray]]
+# =============================================================================
+# Helper: CPU-Backed Dataloader (Prevents T4 OOM Errors)
+# =============================================================================
+def create_cpu_dataloaders(dataset, batch_size, val_split=0.15):
+    """Converts the list of trajectories into CPU-bound PyTorch DataLoaders."""
+    data_list = list(dataset)
+    np.random.shuffle(data_list)
+
+    split_idx = int(len(data_list) * (1 - val_split))
+    train_raw = data_list[:split_idx]
+    val_raw = data_list[split_idx:]
+
+    def to_dataset(raw_list):
+        if not raw_list:
+            return None
+        # KEEP ON CPU: Do not use device='cuda' here!
+        # The MambaController will move batches to GPU during training.
+        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
+        return TensorDataset(o, a)
+
+    train_ds = to_dataset(train_raw)
+    val_ds = to_dataset(val_raw)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True) if val_ds else None
+
+    return train_loader, val_loader
 
 
-def format_seconds(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def estimate_total_training_units(args) -> int:
-    phase = args.phase
-    if phase == "smoke":
-        return max(1, args.smoke_epochs)
-    if phase == "imitation":
-        return max(1, args.epochs)
-    if phase == "cegis":
-        return max(1, args.cegis_cycles)
-    return max(1, args.epochs + args.cegis_cycles)
-
-
-class ProgressTracker:
-    def __init__(self, total_units: int):
-        self.total_units = max(1, total_units)
-        self.completed_units = 0
-        self.start_time = time.time()
-
-    def advance(self, units: int = 1) -> None:
-        self.completed_units = min(self.total_units, self.completed_units + units)
-
-    def eta_string(self) -> str:
-        elapsed = time.time() - self.start_time
-        if self.completed_units <= 0:
-            return "estimating..."
-        avg_time_per_unit = elapsed / self.completed_units
-        remaining_units = max(0, self.total_units - self.completed_units)
-        return format_seconds(avg_time_per_unit * remaining_units)
-
-    def elapsed_string(self) -> str:
-        return format_seconds(time.time() - self.start_time)
-
-
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def save_dataset(path: Path, dataset: DatasetType) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        [
-            (
-                np.asarray(obs_seq, dtype=np.float32),
-                np.asarray(act_seq, dtype=np.float32),
-            )
-            for obs_seq, act_seq in dataset
-        ],
-        path,
-    )
-
-
-def load_dataset(path: Path) -> DatasetType:
-    raw_dataset = torch.load(path, map_location="cpu", weights_only=False)
+# =============================================================================
+# Helper: Generate Baseline Data
+# =============================================================================
+def generate_expert_data(num_traj, seq_steps, dt):
+    print(f"[*] Harvesting {num_traj} expert trajectories...")
+    plant = DronePlant()
+    expert = DroneExpertController()
     dataset = []
-    for obs_seq, act_seq in raw_dataset:
-        dataset.append(
-            (
-                np.asarray(obs_seq, dtype=np.float32),
-                np.asarray(act_seq, dtype=np.float32),
-            )
-        )
+
+    for i in range(num_traj):
+        y = plant.reset()
+        expert.reset()
+        expert.set_plant_ref(plant)
+
+        o_seq, a_seq = [], []
+        for _ in range(seq_steps):
+            u = expert.compute_action(y)
+            o_seq.append(y)
+            a_seq.append(u)
+            y = plant.step(u, dt)
+
+        dataset.append((np.array(o_seq, dtype=np.float32), np.array(a_seq, dtype=np.float32)))
+        if (i + 1) % 500 == 0:
+            print(f"    ...generated {i + 1}/{num_traj}")
+
     return dataset
 
 
-def ensure_dataset(
-    dataset_path: Path,
-    num_trajectories: int,
-    seq_steps: int,
-    dt: float,
-) -> DatasetType:
-    if dataset_path.exists():
-        print(f"Loading dataset from {dataset_path}")
-        return load_dataset(dataset_path)
-
-    print(f"Generating baseline dataset with {num_trajectories} trajectories...")
-    plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
-    expert = DroneExpertController()
-    dataset = generate_expert_demonstrations(
-        plant,
-        expert,
-        num_trajectories=num_trajectories,
-        seq_steps=seq_steps,
-        dt=dt,
-    )
-    save_dataset(dataset_path, dataset)
-    print(f"Saved dataset to {dataset_path}")
-    return dataset
+# =============================================================================
+# Phase Runners
+# =============================================================================
+def run_smoke(controller, args, outdir):
+    """Quick sanity check — kernels compile, backward pass works."""
+    print("\n=== PHASE: SMOKE TEST ===")
+    print("Testing kernel compilation and backward pass...")
+    dataset = generate_expert_data(10, 100, 0.1)
+    train_loader, val_loader = create_cpu_dataloaders(dataset, batch_size=2)
+    metrics = controller.update(train_loader, val_loader, epochs=2, fit_normalizer=True)
+    print(f"Smoke Test Complete. Train Loss: {metrics['train_loss']:.4f} | Val Loss: {metrics['val_loss']:.4f}")
 
 
-def append_metrics(log_path: Path, payload: Dict[str, float]) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
+def run_imitation(controller, args, outdir, dataset):
+    """Pure imitation learning from expert demonstrations."""
+    print("\n=== PHASE: BASELINE IMITATION ===")
+    train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
 
-
-def build_controller(args) -> MambaController:
-    return MambaController(
-        obs_dim=12,
-        action_dim=4,
-        d_model=args.d_model,
-        d_state=args.d_state,
-        num_layers=args.num_layers,
-        lr=args.lr,
-    )
-
-
-def maybe_resume(controller: MambaController, resume_path: Optional[str]) -> Optional[Dict]:
-    if not resume_path:
-        return None
-    print(f"Resuming checkpoint from {resume_path}")
-    return controller.load_checkpoint(resume_path)
-
-
-def checkpoint_score(rollout_metrics: Dict[str, float]) -> float:
-    return (
-        2.0 * rollout_metrics["docking_success_rate"]
-        + rollout_metrics["checkpoint_order_success_rate"]
-        - 0.01 * rollout_metrics["avg_final_distance"]
-    )
-
-
-def save_model_checkpoint(
-    controller: MambaController,
-    checkpoint_path: Path,
-    phase: str,
-    epoch: int,
-    metrics: Dict[str, float],
-) -> None:
-    controller.save_checkpoint(
-        str(checkpoint_path),
-        phase=phase,
-        epoch=epoch,
-        metrics=metrics,
-    )
-
-
-def run_smoke_phase(args, outdir: Path, tracker: Optional[ProgressTracker] = None) -> Path:
-    print("=== Phase 1: Smoke Test ===")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"Using device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
-
-    controller = build_controller(args)
-    maybe_resume(controller, args.resume)
-
-    plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
-    expert = DroneExpertController()
-    dataset = generate_expert_demonstrations(
-        plant,
-        expert,
-        num_trajectories=args.smoke_trajectories,
-        seq_steps=args.smoke_seq_steps,
-        dt=args.dt,
-    )
-    train_loader, val_loader = prepare_dataloaders(
-        dataset,
-        latest_demos=[],
-        batch_size=min(args.batch_size, 16),
-        val_split=0.2,
-        num_workers=args.num_workers,
-        pin_memory=controller.device.type == "cuda",
-    )
-    metrics = controller.update(
-        train_loader,
-        val_loader,
-        epochs=args.smoke_epochs,
-        fit_normalizer=not controller.normalizer_fitted,
-    )
-    rollout_metrics = run_validation_rollouts(
-        controller,
-        plant,
-        num_missions=min(3, args.validation_rollouts),
-        seq_steps=args.smoke_seq_steps,
-        dt=args.dt,
-    )
-    merged = {
-        "phase": "smoke",
-        "epoch": args.smoke_epochs,
-        **metrics,
-        **rollout_metrics,
-    }
-    append_metrics(outdir / "metrics.jsonl", merged)
-    checkpoint_path = outdir / "smoke_last.pt"
-    save_model_checkpoint(controller, checkpoint_path, "smoke", args.smoke_epochs, merged)
-    print(
-        f"Smoke test complete | train={metrics['train_loss']:.4f} "
-        f"| val={metrics['val_loss']:.4f} "
-        f"| dock={rollout_metrics['docking_success_rate']:.2f}"
-    )
-    if tracker is not None:
-        tracker.advance(args.smoke_epochs)
-        print(f"Overall progress | elapsed={tracker.elapsed_string()} | ETA={tracker.eta_string()}")
-    return checkpoint_path
-
-
-def run_imitation_phase(
-    args,
-    outdir: Path,
-    resume_path: Optional[str] = None,
-    tracker: Optional[ProgressTracker] = None,
-) -> Path:
-    print("=== Phase 2: Pure Imitation ===")
-    controller = build_controller(args)
-    maybe_resume(controller, resume_path or args.resume)
-
-    dataset = ensure_dataset(args.dataset_path, args.num_trajectories, args.seq_steps, args.dt)
-    train_loader, val_loader = prepare_dataloaders(
-        dataset,
-        latest_demos=[],
-        batch_size=args.batch_size,
-        val_split=args.val_split,
-        num_workers=args.num_workers,
-        pin_memory=controller.device.type == "cuda",
-    )
-
-    plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
-    best_score = -float("inf")
-    best_checkpoint = outdir / "best_imitation.pt"
-    last_checkpoint = outdir / "last_imitation.pt"
-    phase_start = time.time()
+    best_val_loss = float("inf")
+    csv_log = open(outdir / "imitation_log.csv", "w")
+    csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
         metrics = controller.update(
-            train_loader,
-            val_loader,
+            train_loader, val_loader,
             epochs=1,
             fit_normalizer=(epoch == 1 and not controller.normalizer_fitted),
         )
+        t_loss = metrics["train_loss"]
+        v_loss = metrics["val_loss"]
+        lr = metrics["lr"]
 
-        rollout_metrics = {
-            "checkpoint_order_success_rate": float("nan"),
-            "docking_success_rate": float("nan"),
-            "avg_final_distance": float("nan"),
-            "avg_checkpoints_reached": float("nan"),
-        }
-        if epoch % args.validation_rollout_interval == 0 or epoch == args.epochs:
-            rollout_metrics = run_validation_rollouts(
-                controller,
-                plant,
-                num_missions=args.validation_rollouts,
-                seq_steps=args.seq_steps,
-                dt=args.dt,
-            )
+        csv_log.write(f"{epoch},{t_loss:.6f},{v_loss:.6f},{lr:.2e}\n")
+        csv_log.flush()
 
-        merged = {"phase": "imitation", "epoch": epoch, **metrics, **rollout_metrics}
-        append_metrics(outdir / "metrics.jsonl", merged)
-        save_model_checkpoint(controller, last_checkpoint, "imitation", epoch, merged)
+        print(f"Epoch {epoch:03d}/{args.epochs} | Train MSE: {t_loss:.5f} | Val MSE: {v_loss:.5f} | LR: {lr:.2e}")
 
-        current_score = checkpoint_score(rollout_metrics) if not np.isnan(rollout_metrics["docking_success_rate"]) else -float("inf")
-        if current_score > best_score:
-            best_score = current_score
-            save_model_checkpoint(controller, best_checkpoint, "imitation", epoch, merged)
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            controller.save_checkpoint(str(outdir / "best_imitation.pt"), phase="imitation", epoch=epoch)
+            print("   -> Saved new best checkpoint.")
 
-        epoch_duration = time.time() - epoch_start
-        remaining_epochs = args.epochs - epoch
-        phase_eta = format_seconds((time.time() - phase_start) / epoch * remaining_epochs)
-        if tracker is not None:
-            tracker.advance(1)
-            overall_eta = tracker.eta_string()
-            overall_elapsed = tracker.elapsed_string()
-        else:
-            overall_eta = "n/a"
-            overall_elapsed = format_seconds(time.time() - phase_start)
-        print(
-            f"Epoch {epoch:03d} | train={metrics['train_loss']:.4f} | "
-            f"val={metrics['val_loss']:.4f} | lr={metrics['lr']:.2e} | "
-            f"dock={rollout_metrics['docking_success_rate']:.2f} | "
-            f"checkpoints={rollout_metrics['checkpoint_order_success_rate']:.2f} | "
-            f"epoch_time={format_seconds(epoch_duration)} | "
-            f"phase_eta={phase_eta} | overall_eta={overall_eta} | elapsed={overall_elapsed}"
-        )
-
-    return best_checkpoint if best_checkpoint.exists() else last_checkpoint
+    csv_log.close()
+    controller.save_checkpoint(str(outdir / "last_imitation.pt"), phase="imitation", epoch=args.epochs)
+    print("\n[*] Imitation Phase Complete.")
+    return outdir / "best_imitation.pt"
 
 
-def run_cegis_phase(
-    args,
-    outdir: Path,
-    resume_path: Optional[str] = None,
-    tracker: Optional[ProgressTracker] = None,
-) -> Path:
-    print("=== Phase 3: CEGIS Refinement ===")
-    controller = build_controller(args)
-    maybe_resume(controller, resume_path or args.resume)
+def run_cegis(controller, args, outdir, dataset):
+    """CEGIS refinement — falsify, fix, retrain."""
+    print("\n=== PHASE: CEGIS REFINEMENT ===")
 
-    plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
+    plant = DronePlant()
     expert = DroneExpertController()
     expert.set_plant_ref(plant)
 
-    base_dataset = ensure_dataset(args.dataset_path, args.num_trajectories, args.seq_steps, args.dt)
-    dataset = deque(base_dataset, maxlen=max(len(base_dataset) + 1000, 4000))
-    latest_demos = []
-    best_checkpoint = outdir / "best_cegis.pt"
-    last_checkpoint = outdir / "last_cegis.pt"
-    best_score = -float("inf")
-    phase_start = time.time()
+    csv_log = open(outdir / "cegis_log.csv", "w")
+    csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
 
     for cycle in range(1, args.cegis_cycles + 1):
-        cycle_start = time.time()
-        train_loader, val_loader = prepare_dataloaders(
-            dataset,
-            latest_demos,
-            batch_size=args.batch_size,
-            val_split=args.val_split,
-            num_workers=args.num_workers,
-            pin_memory=controller.device.type == "cuda",
-        )
+        print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
 
-        metrics = controller.update(
-            train_loader,
-            val_loader,
-            epochs=args.cegis_epochs,
-            fit_normalizer=(cycle == 1 and not controller.normalizer_fitted),
-        )
-        rollout_metrics = run_validation_rollouts(
-            controller,
-            plant,
-            num_missions=args.validation_rollouts,
-            seq_steps=args.seq_steps,
-            dt=args.dt,
-        )
+        # 1. Hunt for failures
+        print("[*] Falsifier hunting for edge cases...")
         failures = falsify_cem(
-            controller,
-            plant,
-            expert,
-            num_generations=args.cem_generations,
-            pop_size=args.cem_population,
-            seq_steps=args.seq_steps,
-            dt=args.dt,
-        )
-        latest_demos = fix_and_merge(
-            failures,
-            expert,
-            plant,
-            dataset,
-            seq_steps=args.seq_steps,
-            dt=args.dt,
+            controller, plant, expert,
+            pop_size=20, seq_steps=args.seq_steps, dt=0.1,
         )
 
-        merged = {
-            "phase": "cegis",
-            "cycle": cycle,
-            "failures": float(len(failures)),
-            "dataset_size": float(len(dataset)),
-            **metrics,
-            **rollout_metrics,
-        }
-        append_metrics(outdir / "metrics.jsonl", merged)
-        save_model_checkpoint(controller, last_checkpoint, "cegis", cycle, merged)
+        num_fails = len(failures)
+        coverage = (1.0 - min(1.0, num_fails / 60.0)) * 100
+        print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.1f}%")
 
-        current_score = checkpoint_score(rollout_metrics) - 0.05 * len(failures)
-        if current_score > best_score:
-            best_score = current_score
-            save_model_checkpoint(controller, best_checkpoint, "cegis", cycle, merged)
-
-        cycle_duration = time.time() - cycle_start
-        remaining_cycles = args.cegis_cycles - cycle
-        phase_eta = format_seconds((time.time() - phase_start) / cycle * remaining_cycles)
-        if tracker is not None:
-            tracker.advance(1)
-            overall_eta = tracker.eta_string()
-            overall_elapsed = tracker.elapsed_string()
-        else:
-            overall_eta = "n/a"
-            overall_elapsed = format_seconds(time.time() - phase_start)
-        print(
-            f"Cycle {cycle:02d} | train={metrics['train_loss']:.4f} | "
-            f"val={metrics['val_loss']:.4f} | failures={len(failures)} | "
-            f"dock={rollout_metrics['docking_success_rate']:.2f} | "
-            f"cycle_time={format_seconds(cycle_duration)} | "
-            f"phase_eta={phase_eta} | overall_eta={overall_eta} | elapsed={overall_elapsed}"
-        )
-        if not failures:
-            print("CEGIS converged with zero discovered failures.")
+        if num_fails == 0:
+            print("\n✔️  CEGIS Converged! 100% Safety Coverage achieved.")
+            controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
             break
 
-    return best_checkpoint if best_checkpoint.exists() else last_checkpoint
+        # 2. Expert Intervention
+        print("[*] Generating expert corrections...")
+        fix_and_merge(failures, expert, plant, dataset, args.seq_steps, 0.1)
+
+        # 3. Retrain
+        print(f"[*] Retraining on updated dataset (Size: {len(dataset)})...")
+        train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
+        metrics = controller.update(
+            train_loader, val_loader,
+            epochs=5,
+            fit_normalizer=(cycle == 1 and not controller.normalizer_fitted),
+        )
+        t_loss = metrics["train_loss"]
+        v_loss = metrics["val_loss"]
+
+        csv_log.write(f"{cycle},{num_fails},{coverage:.1f},{t_loss:.6f},{v_loss:.6f}\n")
+        csv_log.flush()
+
+        # Save progress
+        controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), phase="cegis", cycle=cycle)
+
+    csv_log.close()
+    controller.save_checkpoint(str(outdir / "last_cegis.pt"), phase="cegis", cycle=args.cegis_cycles)
+    print("\n[*] CEGIS Pipeline Finished.")
+    return outdir / "best_cegis.pt"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train NNCS-Mamba on a single T4-friendly pipeline.")
-    parser.add_argument("--phase", choices=["smoke", "imitation", "cegis", "all"], default="imitation")
-    parser.add_argument("--dataset-path", type=Path, default=Path("artifacts/baseline_dataset.pt"))
-    parser.add_argument("--outdir", type=Path, default=Path("runs/default"))
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="NNCS-Mamba Robust Trainer")
+    parser.add_argument("--phase", choices=["smoke", "imitation", "cegis", "all"], required=True)
+    parser.add_argument("--outdir", type=str, default="runs/experiment")
+    parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
+
+    # Hyperparameters
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--d-state", type=int, default=16)
-    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=32)
+
+    # Data & Training
+    parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
-    parser.add_argument("--num-trajectories", type=int, default=5000)
-    parser.add_argument("--dt", type=float, default=0.1)
-    parser.add_argument("--val-split", type=float, default=0.15)
-    parser.add_argument("--validation-rollouts", type=int, default=5)
-    parser.add_argument("--validation-rollout-interval", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--smoke-trajectories", type=int, default=32)
-    parser.add_argument("--smoke-seq-steps", type=int, default=120)
-    parser.add_argument("--smoke-epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--cegis-cycles", type=int, default=20)
-    parser.add_argument("--cegis-epochs", type=int, default=5)
-    parser.add_argument("--cem-generations", type=int, default=1)
-    parser.add_argument("--cem-population", type=int, default=20)
-    return parser.parse_args()
+    parser.add_argument("--seed", type=int, default=42)
 
+    args = parser.parse_args()
 
-def main():
-    args = parse_args()
-    args.outdir.mkdir(parents=True, exist_ok=True)
-    set_seed(args.seed)
-    tracker = ProgressTracker(estimate_total_training_units(args))
+    # Setup
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    checkpoint_path = None
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Save config
+    with open(outdir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=4)
+
+    # Initialize Controller
+    print("[*] Initializing Mamba Controller...")
+    controller = MambaController(
+        obs_dim=12, action_dim=4,
+        d_model=args.d_model, d_state=args.d_state,
+        num_layers=args.layers, lr=args.lr,
+    )
+    print(f"    Device: {controller.device}")
+
+    if args.resume:
+        print(f"[*] Resuming from checkpoint: {args.resume}")
+        controller.load_checkpoint(args.resume)
+
+    # ── Smoke ──
     if args.phase == "smoke":
-        run_smoke_phase(args, args.outdir, tracker=tracker)
+        run_smoke(controller, args, outdir)
         return
 
+    # ── Generate dataset (shared by imitation & cegis) ──
+    dataset = deque(maxlen=args.num_traj + 1000)
+    raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+    dataset.extend(raw_data)
+
+    # ── Imitation ──
     if args.phase == "imitation":
-        run_imitation_phase(args, args.outdir, tracker=tracker)
+        run_imitation(controller, args, outdir, dataset)
         return
 
+    # ── CEGIS ──
     if args.phase == "cegis":
-        run_cegis_phase(args, args.outdir, tracker=tracker)
+        run_cegis(controller, args, outdir, dataset)
         return
 
-    checkpoint_path = run_imitation_phase(args, args.outdir, tracker=tracker)
-    run_cegis_phase(args, args.outdir, resume_path=str(checkpoint_path), tracker=tracker)
+    # ── All: Imitation → CEGIS ──
+    best_imitation = run_imitation(controller, args, outdir, dataset)
+    # Controller already has the trained weights in memory, just continue to CEGIS
+    run_cegis(controller, args, outdir, dataset)
 
 
 if __name__ == "__main__":
