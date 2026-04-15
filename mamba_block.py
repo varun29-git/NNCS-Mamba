@@ -159,7 +159,7 @@ class MambaBlock(nn.Module):
             # h: [B, D_Inner, D_State]
             # [B, D_Inner, D_State] * [B, D_Inner, 1] -> [B, D_Inner, D_State]
             dA = torch.exp(dt.transpose(1, 2) * A)
-            dB = dt.transpose(1, 2) * B.transpose(1, 2)
+            dB = dt.transpose(1, 2) * B
             
             # Recurrence
             # x: [B, 1, D_Inner] -> [B, D_Inner, 1]
