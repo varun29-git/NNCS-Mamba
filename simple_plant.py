@@ -68,9 +68,9 @@ if __name__ == "__main__":
     # 2. Train Mamba Controller
     print("Training Mamba model on expert trajectories...")
     for epoch in range(20):
-        loss = mamba_ctrl.update(dataset)
+        metrics = mamba_ctrl.update(dataset)
         if epoch % 5 == 0:
-            print(f"Epoch {epoch}, Loss: {loss:.4f}")
+            print(f"Epoch {epoch}, Loss: {metrics['train_loss']:.4f}")
             
     # 3. Test Closed-Loop Runtime of Mamba
     print("Evaluating closed loop performance...")

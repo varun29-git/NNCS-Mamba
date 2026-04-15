@@ -253,7 +253,63 @@ def fix_and_merge(failed_inits, expert_ctrl, plant, dataset, seq_steps=300, dt=0
     return latest_demonstrations
 
 
-def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
+def generate_expert_demonstrations(
+    plant,
+    expert_ctrl,
+    num_trajectories=2000,
+    seq_steps=300,
+    dt=0.1,
+    initial_states=None,
+):
+    """
+    Generate expert trajectories for baseline imitation training.
+    """
+    dataset = []
+    for idx in range(num_trajectories):
+        if initial_states is None:
+            y = plant.reset()
+        else:
+            plant.reset()
+            plant.state = initial_states[idx].copy()
+            plant.time = 0.0
+            y = plant.state.copy()
+
+        expert_ctrl.reset()
+        expert_ctrl.set_plant_ref(plant)
+        obs_seq, act_seq = [], []
+        for _ in range(seq_steps):
+            u = expert_ctrl.compute_action(y)
+            obs_seq.append(y)
+            act_seq.append(u)
+            y = plant.step(u, dt)
+
+        dataset.append((np.asarray(obs_seq, dtype=np.float32), np.asarray(act_seq, dtype=np.float32)))
+    return dataset
+
+
+def build_sequence_loader(raw_list, batch_size=32, shuffle=False, num_workers=0, pin_memory=False):
+    if not raw_list:
+        return None
+    obs = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+    act = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
+    return DataLoader(
+        TensorDataset(obs, act),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def prepare_dataloaders(
+    dataset,
+    latest_demos,
+    batch_size=32,
+    val_split=0.15,
+    num_workers=0,
+    pin_memory=False,
+    shuffle=True,
+):
     """
     Build train/val DataLoaders with 50/50 oversampling of latest failure demonstrations.
     """
@@ -267,8 +323,8 @@ def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
     def to_tensors(raw_list):
         if not raw_list:
             return None, None
-        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32, device=device)
-        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32, device=device)
+        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
         return o, a
 
     train_obs, train_act = to_tensors(train_raw)
@@ -282,10 +338,86 @@ def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
             train_obs = torch.cat([train_obs, ld_obs.repeat(repeat_count, 1, 1)], dim=0)
             train_act = torch.cat([train_act, ld_act.repeat(repeat_count, 1, 1)], dim=0)
         
-    train_loader = DataLoader(TensorDataset(train_obs, train_act), batch_size=8, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_obs, val_act), batch_size=8) if val_obs is not None else None
+    train_loader = DataLoader(
+        TensorDataset(train_obs, train_act),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = None
+    if val_obs is not None:
+        val_loader = DataLoader(
+            TensorDataset(val_obs, val_act),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
     
     return train_loader, val_loader
+
+
+def summarize_rollout(trajectory_y, checkpoint_radius=CHECKPOINT_RADIUS, dock_radius=2.0):
+    positions = np.asarray(trajectory_y)[:, 0:3]
+    checkpoints_reached = 0
+    for checkpoint in CHECKPOINTS[:3]:
+        if np.any(np.linalg.norm(positions - checkpoint, axis=1) < checkpoint_radius):
+            checkpoints_reached += 1
+        else:
+            break
+
+    final_distance = float(np.linalg.norm(positions[-1] - CHECKPOINTS[-1]))
+    docked = bool(final_distance <= dock_radius)
+    return {
+        "checkpoints_reached": checkpoints_reached,
+        "checkpoint_order_success": float(checkpoints_reached == 3),
+        "docking_success": float(docked),
+        "final_distance": final_distance,
+    }
+
+
+def run_validation_rollouts(
+    mamba_ctrl,
+    plant,
+    num_missions=5,
+    seq_steps=300,
+    dt=0.1,
+    initial_states=None,
+):
+    metrics = {
+        "checkpoint_order_success_rate": 0.0,
+        "docking_success_rate": 0.0,
+        "avg_final_distance": 0.0,
+        "avg_checkpoints_reached": 0.0,
+    }
+    if num_missions <= 0:
+        return metrics
+
+    rollout_summaries = []
+    for mission_idx in range(num_missions):
+        if initial_states is None:
+            y = plant.reset()
+        else:
+            plant.reset()
+            plant.state = initial_states[mission_idx].copy()
+            plant.time = 0.0
+            y = plant.state.copy()
+
+        mamba_ctrl.reset()
+        traj = [y]
+        for _ in range(seq_steps):
+            u = mamba_ctrl.forward(y)
+            y = plant.step(u, dt)
+            traj.append(y)
+
+        rollout_summaries.append(summarize_rollout(traj))
+
+    metrics["checkpoint_order_success_rate"] = float(np.mean([x["checkpoint_order_success"] for x in rollout_summaries]))
+    metrics["docking_success_rate"] = float(np.mean([x["docking_success"] for x in rollout_summaries]))
+    metrics["avg_final_distance"] = float(np.mean([x["final_distance"] for x in rollout_summaries]))
+    metrics["avg_checkpoints_reached"] = float(np.mean([x["checkpoints_reached"] for x in rollout_summaries]))
+    return metrics
 
 
 def build_cegis_framework():
@@ -315,11 +447,26 @@ def build_cegis_framework():
         print(f"--- Iteration {cycle}/{MAX_ITER} ---")
         print(f"{'='*50}")
         
-        train_loader, val_loader = prepare_dataloaders(dataset, latest_demos, mamba_ctrl.device)
+        train_loader, val_loader = prepare_dataloaders(
+            dataset,
+            latest_demos,
+            batch_size=32,
+            num_workers=0,
+            pin_memory=mamba_ctrl.device.type == "cuda",
+        )
         
         epochs = 5 if cycle == 1 else min(15, max(3, len(latest_demos)))
-        t_loss, v_loss = mamba_ctrl.update(train_loader, val_loader, epochs=epochs)
-        print(f"-> Train MSE: {t_loss:.4f} | Val MSE: {v_loss:.4f} | Dataset: {len(dataset)}")
+        metrics = mamba_ctrl.update(
+            train_loader,
+            val_loader,
+            epochs=epochs,
+            fit_normalizer=cycle == 1 and not mamba_ctrl.normalizer_fitted,
+        )
+        print(
+            f"-> Train MSE: {metrics['train_loss']:.4f} | "
+            f"Val MSE: {metrics['val_loss']:.4f} | "
+            f"Dataset: {len(dataset)}"
+        )
         
         # Falsification
         print("-> Running CEM Falsifier (multi-checkpoint + mass decay)...")

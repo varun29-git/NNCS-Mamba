@@ -21,8 +21,8 @@ def test_mamba_training():
     
     # Train for a few epochs
     for epoch in range(10):
-        loss = controller.update(dataset)
-        print(f"Epoch {epoch+1}, Loss: {loss:.4f}")
+        metrics = controller.update(dataset)
+        print(f"Epoch {epoch+1}, Loss: {metrics['train_loss']:.4f}")
         
     print("Testing autoregressive forward pass...")
     controller.reset()

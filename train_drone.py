@@ -35,9 +35,9 @@ def evaluate_drone():
     print("Training Mamba sequence model...")
     # Train Mamba natively across sequence representations
     for epoch in range(1, 21):
-        loss = mamba_ctrl.update(dataset)
+        metrics = mamba_ctrl.update(dataset)
         if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:02d} | Sequence MSE Loss: {loss:.4f}")
+            print(f"Epoch {epoch:02d} | Sequence MSE Loss: {metrics['train_loss']:.4f}")
             
     print("\n--- ZERO-SHOT CLOSED-LOOP EVALUATION ---")
     print("Mamba evaluates online tracking with hidden state persistence.")
