@@ -1,5 +1,12 @@
-numpy
-torch>=2.0.0
-mamba-ssm
-causal-conv1d
-matplotlib
+# 1. Downgrade to a highly stable PyTorch version (CUDA 12.1)
+!pip install torch==2.2.1 torchvision==0.17.1 torchaudio==2.2.1 --index-url https://download.pytorch.org/whl/cu121
+
+# 2. Install build utilities
+!pip install -q packaging ninja
+
+# 3. Install pre-compiled Mamba components (SKIPS THE 20 MINUTE WAIT)
+!pip install -q causal-conv1d==1.2.0.post2
+!pip install -q mamba-ssm==1.2.0.post1
+
+# 4. Install standard dependencies
+!pip install -q matplotlib numpy
