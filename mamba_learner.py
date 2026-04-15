@@ -6,15 +6,12 @@ import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
-
-from mamba_ssm import Mamba
-from mamba_ssm.utils.generation import InferenceParams
+from mamba_block import MambaBlock, MambaCache
 
 class MambaController(LearnerController, nn.Module):
     """
-    Production-ready Neural Network Controller using `mamba-ssm`.
-    Implements proper O(1) causal inference cache parameters, batched sequence learning,
-    and device scaling operations.
+    Pure PyTorch Mamba Controller.
+    No CUDA dependencies. Implements S6 Selective Scan for drone control.
     """
     def __init__(
         self,
@@ -48,7 +45,7 @@ class MambaController(LearnerController, nn.Module):
         self.input_layer = nn.Linear(obs_dim, d_model)
         
         self.mamba_blocks = nn.ModuleList([
-            Mamba(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
+            MambaBlock(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
             for _ in range(num_layers)
         ])
         self.norms = nn.ModuleList([
@@ -57,8 +54,8 @@ class MambaController(LearnerController, nn.Module):
         
         self.output_layer = nn.Linear(d_model, action_dim)
         
-        # Internal state manager for autoregressive steps
-        self.inference_params = None
+        # Internal state caches for step-by-step inference
+        self.layer_caches = []
 
         self.to(self.device)
         
@@ -91,19 +88,20 @@ class MambaController(LearnerController, nn.Module):
         }
         
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
-        """Resets the internal hidden memory cache for autoregressive steps across episodes."""
-        self.max_seq_len = max_seq_len
-        self.max_batch_size = max_batch_size
-        self.inference_params = InferenceParams(max_seqlen=max_seq_len, max_batch_size=max_batch_size)
-        self.inference_params.seqlen_offset = 0
+        """Resets the internal hidden memory cache for autoregressive steps."""
+        self.layer_caches = [
+            MambaCache(
+                batch_size=max_batch_size, 
+                d_model=self.d_model, 
+                d_state=self.d_state, 
+                d_conv=4, 
+                device=self.device
+            ) for _ in range(self.num_layers)
+        ]
 
     def _ensure_inference_state(self) -> None:
-        if self.inference_params is None:
-            self.reset(max_seq_len=self.max_seq_len, max_batch_size=self.max_batch_size)
-            return
-
-        if self.inference_params.seqlen_offset >= self.max_seq_len - 1:
-            self.reset(max_seq_len=self.max_seq_len, max_batch_size=self.max_batch_size)
+        if not self.layer_caches:
+            self.reset(max_batch_size=self.max_batch_size)
 
     def _encode_inputs(self, batch_obs: torch.Tensor) -> torch.Tensor:
         normalized_obs = self._normalize_observations(batch_obs)
@@ -148,14 +146,13 @@ class MambaController(LearnerController, nn.Module):
 
     def _run_cached_step(self, obs_tensor: torch.Tensor) -> torch.Tensor:
         x = self._encode_inputs(obs_tensor)
-        for block, norm in zip(self.mamba_blocks, self.norms):
-            x = x + block(norm(x), inference_params=self.inference_params)
-        self.inference_params.seqlen_offset += 1
+        for block, norm, cache in zip(self.mamba_blocks, self.norms, self.layer_caches):
+            x = x + block(norm(x), cache=cache)
         return self.output_layer(x)
         
     def forward(self, y: np.ndarray) -> np.ndarray:
         """
-        Autoregressive step in O(1) utilizing hardware-efficient cached recurrent transitions.
+        Step-by-step inference.
         """
         self.eval()
         with torch.no_grad():
@@ -227,11 +224,6 @@ class MambaController(LearnerController, nn.Module):
         num_workers: int = 0,
         pin_memory: Optional[bool] = None,
     ) -> Dict[str, float]:
-        """
-        Trains on either:
-        - a raw dataset of (obs_seq, act_seq) tuples, or
-        - a prebuilt training DataLoader plus optional validation DataLoader.
-        """
         if isinstance(dataset_or_loader, DataLoader):
             train_loader = dataset_or_loader
         else:
