@@ -39,7 +39,7 @@ def estimate_total_training_units(args) -> int:
         return max(1, args.epochs)
     if phase == "cegis":
         return max(1, args.cegis_cycles)
-    return max(1, args.smoke_epochs + args.epochs + args.cegis_cycles)
+    return max(1, args.epochs + args.cegis_cycles)
 
 
 class ProgressTracker:
@@ -426,7 +426,7 @@ def parse_args():
     parser.add_argument("--d-state", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--seq-steps", type=int, default=300)
-    parser.add_argument("--num-trajectories", type=int, default=2000)
+    parser.add_argument("--num-trajectories", type=int, default=5000)
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--validation-rollouts", type=int, default=5)
@@ -435,7 +435,7 @@ def parse_args():
     parser.add_argument("--smoke-trajectories", type=int, default=32)
     parser.add_argument("--smoke-seq-steps", type=int, default=120)
     parser.add_argument("--smoke-epochs", type=int, default=3)
-    parser.add_argument("--cegis-cycles", type=int, default=10)
+    parser.add_argument("--cegis-cycles", type=int, default=20)
     parser.add_argument("--cegis-epochs", type=int, default=5)
     parser.add_argument("--cem-generations", type=int, default=1)
     parser.add_argument("--cem-population", type=int, default=20)
@@ -461,8 +461,7 @@ def main():
         run_cegis_phase(args, args.outdir, tracker=tracker)
         return
 
-    checkpoint_path = run_smoke_phase(args, args.outdir, tracker=tracker)
-    checkpoint_path = run_imitation_phase(args, args.outdir, resume_path=str(checkpoint_path), tracker=tracker)
+    checkpoint_path = run_imitation_phase(args, args.outdir, tracker=tracker)
     run_cegis_phase(args, args.outdir, resume_path=str(checkpoint_path), tracker=tracker)
 
 
