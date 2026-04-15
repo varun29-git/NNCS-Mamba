@@ -1,2 +1,5 @@
 numpy
+torch>=2.4.0
 matplotlib
+packaging
+ninja
