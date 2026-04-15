@@ -2,6 +2,7 @@ import argparse
 import json
 from collections import deque
 from pathlib import Path
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,47 @@ from mamba_learner import MambaController
 
 
 DatasetType = List[Tuple[np.ndarray, np.ndarray]]
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def estimate_total_training_units(args) -> int:
+    phase = args.phase
+    if phase == "smoke":
+        return max(1, args.smoke_epochs)
+    if phase == "imitation":
+        return max(1, args.epochs)
+    if phase == "cegis":
+        return max(1, args.cegis_cycles)
+    return max(1, args.smoke_epochs + args.epochs + args.cegis_cycles)
+
+
+class ProgressTracker:
+    def __init__(self, total_units: int):
+        self.total_units = max(1, total_units)
+        self.completed_units = 0
+        self.start_time = time.time()
+
+    def advance(self, units: int = 1) -> None:
+        self.completed_units = min(self.total_units, self.completed_units + units)
+
+    def eta_string(self) -> str:
+        elapsed = time.time() - self.start_time
+        if self.completed_units <= 0:
+            return "estimating..."
+        avg_time_per_unit = elapsed / self.completed_units
+        remaining_units = max(0, self.total_units - self.completed_units)
+        return format_seconds(avg_time_per_unit * remaining_units)
+
+    def elapsed_string(self) -> str:
+        return format_seconds(time.time() - self.start_time)
 
 
 def set_seed(seed: int) -> None:
@@ -127,7 +169,7 @@ def save_model_checkpoint(
     )
 
 
-def run_smoke_phase(args, outdir: Path) -> Path:
+def run_smoke_phase(args, outdir: Path, tracker: Optional[ProgressTracker] = None) -> Path:
     print("=== Phase 1: Smoke Test ===")
     print(f"CUDA available: {torch.cuda.is_available()}")
     print(f"Using device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
@@ -179,10 +221,18 @@ def run_smoke_phase(args, outdir: Path) -> Path:
         f"| val={metrics['val_loss']:.4f} "
         f"| dock={rollout_metrics['docking_success_rate']:.2f}"
     )
+    if tracker is not None:
+        tracker.advance(args.smoke_epochs)
+        print(f"Overall progress | elapsed={tracker.elapsed_string()} | ETA={tracker.eta_string()}")
     return checkpoint_path
 
 
-def run_imitation_phase(args, outdir: Path, resume_path: Optional[str] = None) -> Path:
+def run_imitation_phase(
+    args,
+    outdir: Path,
+    resume_path: Optional[str] = None,
+    tracker: Optional[ProgressTracker] = None,
+) -> Path:
     print("=== Phase 2: Pure Imitation ===")
     controller = build_controller(args)
     maybe_resume(controller, resume_path or args.resume)
@@ -201,8 +251,10 @@ def run_imitation_phase(args, outdir: Path, resume_path: Optional[str] = None) -
     best_score = -float("inf")
     best_checkpoint = outdir / "best_imitation.pt"
     last_checkpoint = outdir / "last_imitation.pt"
+    phase_start = time.time()
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
         metrics = controller.update(
             train_loader,
             val_loader,
@@ -234,17 +286,34 @@ def run_imitation_phase(args, outdir: Path, resume_path: Optional[str] = None) -
             best_score = current_score
             save_model_checkpoint(controller, best_checkpoint, "imitation", epoch, merged)
 
+        epoch_duration = time.time() - epoch_start
+        remaining_epochs = args.epochs - epoch
+        phase_eta = format_seconds((time.time() - phase_start) / epoch * remaining_epochs)
+        if tracker is not None:
+            tracker.advance(1)
+            overall_eta = tracker.eta_string()
+            overall_elapsed = tracker.elapsed_string()
+        else:
+            overall_eta = "n/a"
+            overall_elapsed = format_seconds(time.time() - phase_start)
         print(
             f"Epoch {epoch:03d} | train={metrics['train_loss']:.4f} | "
             f"val={metrics['val_loss']:.4f} | lr={metrics['lr']:.2e} | "
             f"dock={rollout_metrics['docking_success_rate']:.2f} | "
-            f"checkpoints={rollout_metrics['checkpoint_order_success_rate']:.2f}"
+            f"checkpoints={rollout_metrics['checkpoint_order_success_rate']:.2f} | "
+            f"epoch_time={format_seconds(epoch_duration)} | "
+            f"phase_eta={phase_eta} | overall_eta={overall_eta} | elapsed={overall_elapsed}"
         )
 
     return best_checkpoint if best_checkpoint.exists() else last_checkpoint
 
 
-def run_cegis_phase(args, outdir: Path, resume_path: Optional[str] = None) -> Path:
+def run_cegis_phase(
+    args,
+    outdir: Path,
+    resume_path: Optional[str] = None,
+    tracker: Optional[ProgressTracker] = None,
+) -> Path:
     print("=== Phase 3: CEGIS Refinement ===")
     controller = build_controller(args)
     maybe_resume(controller, resume_path or args.resume)
@@ -259,8 +328,10 @@ def run_cegis_phase(args, outdir: Path, resume_path: Optional[str] = None) -> Pa
     best_checkpoint = outdir / "best_cegis.pt"
     last_checkpoint = outdir / "last_cegis.pt"
     best_score = -float("inf")
+    phase_start = time.time()
 
     for cycle in range(1, args.cegis_cycles + 1):
+        cycle_start = time.time()
         train_loader, val_loader = prepare_dataloaders(
             dataset,
             latest_demos,
@@ -317,10 +388,22 @@ def run_cegis_phase(args, outdir: Path, resume_path: Optional[str] = None) -> Pa
             best_score = current_score
             save_model_checkpoint(controller, best_checkpoint, "cegis", cycle, merged)
 
+        cycle_duration = time.time() - cycle_start
+        remaining_cycles = args.cegis_cycles - cycle
+        phase_eta = format_seconds((time.time() - phase_start) / cycle * remaining_cycles)
+        if tracker is not None:
+            tracker.advance(1)
+            overall_eta = tracker.eta_string()
+            overall_elapsed = tracker.elapsed_string()
+        else:
+            overall_eta = "n/a"
+            overall_elapsed = format_seconds(time.time() - phase_start)
         print(
             f"Cycle {cycle:02d} | train={metrics['train_loss']:.4f} | "
             f"val={metrics['val_loss']:.4f} | failures={len(failures)} | "
-            f"dock={rollout_metrics['docking_success_rate']:.2f}"
+            f"dock={rollout_metrics['docking_success_rate']:.2f} | "
+            f"cycle_time={format_seconds(cycle_duration)} | "
+            f"phase_eta={phase_eta} | overall_eta={overall_eta} | elapsed={overall_elapsed}"
         )
         if not failures:
             print("CEGIS converged with zero discovered failures.")
@@ -363,23 +446,24 @@ def main():
     args = parse_args()
     args.outdir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed)
+    tracker = ProgressTracker(estimate_total_training_units(args))
 
     checkpoint_path = None
     if args.phase == "smoke":
-        run_smoke_phase(args, args.outdir)
+        run_smoke_phase(args, args.outdir, tracker=tracker)
         return
 
     if args.phase == "imitation":
-        run_imitation_phase(args, args.outdir)
+        run_imitation_phase(args, args.outdir, tracker=tracker)
         return
 
     if args.phase == "cegis":
-        run_cegis_phase(args, args.outdir)
+        run_cegis_phase(args, args.outdir, tracker=tracker)
         return
 
-    checkpoint_path = run_smoke_phase(args, args.outdir)
-    checkpoint_path = run_imitation_phase(args, args.outdir, resume_path=str(checkpoint_path))
-    run_cegis_phase(args, args.outdir, resume_path=str(checkpoint_path))
+    checkpoint_path = run_smoke_phase(args, args.outdir, tracker=tracker)
+    checkpoint_path = run_imitation_phase(args, args.outdir, resume_path=str(checkpoint_path), tracker=tracker)
+    run_cegis_phase(args, args.outdir, resume_path=str(checkpoint_path), tracker=tracker)
 
 
 if __name__ == "__main__":
