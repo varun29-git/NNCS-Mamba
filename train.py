@@ -247,10 +247,30 @@ def main():
         run_smoke(controller, args, outdir)
         return
 
-    # ── Generate dataset (shared by imitation & cegis) ──
+    # ── Dataset Management ──
+    # Cache the baseline dataset to avoid re-harvesting (saves 5-10 mins on restart)
+    cache_path = Path("baseline_dataset.pt")
     dataset = deque(maxlen=args.num_traj + 1000)
-    raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
-    dataset.extend(raw_data)
+    
+    if cache_path.exists() and args.num_traj > 0:
+        print(f"[*] Loading cached baseline dataset from {cache_path}...")
+        try:
+            cached_data = torch.load(cache_path, weights_only=True)
+            # If the user requested a different number of trajectories, adjust
+            if len(cached_data) > args.num_traj:
+                cached_data = cached_data[:args.num_traj]
+            dataset.extend(cached_data)
+            print(f"    Loaded {len(dataset)} trajectories.")
+        except Exception as e:
+            print(f"    [!] Failed to load cache: {e}. Re-harvesting...")
+            raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+            dataset.extend(raw_data)
+            torch.save(list(dataset), cache_path)
+    elif args.num_traj > 0:
+        raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+        dataset.extend(raw_data)
+        torch.save(list(dataset), cache_path)
+        print(f"[*] Baseline dataset cached to {cache_path}")
 
     # ── Imitation ──
     if args.phase == "imitation":
@@ -259,12 +279,12 @@ def main():
 
     # ── CEGIS ──
     if args.phase == "cegis":
+        # If resuming for CEGIS, we might not need to harvest if we just want to hunt
         run_cegis(controller, args, outdir, dataset)
         return
 
     # ── All: Imitation → CEGIS ──
-    best_imitation = run_imitation(controller, args, outdir, dataset)
-    # Controller already has the trained weights in memory, just continue to CEGIS
+    run_imitation(controller, args, outdir, dataset)
     run_cegis(controller, args, outdir, dataset)
 
 
