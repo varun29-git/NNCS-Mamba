@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
 from mamba_block import MambaBlock, MambaCache
+from muon_optimizer import Muon
 
 class MambaController(LearnerController, nn.Module):
     """
@@ -60,10 +61,21 @@ class MambaController(LearnerController, nn.Module):
 
         self.to(self.device)
         
-        # Persistent optimizer & loss function
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        # Muon + AdamW Brain Split Optimizer Setup
+        muon_params = []
+        adam_params = []
+        for name, param in self.named_parameters():
+            if param.ndim == 2:
+                muon_params.append(param)
+            else:
+                adam_params.append(param)
+        
+        # Consistent with standard Muon usage: Higher LR for Muon, baseline for AdamW
+        self.optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
+        self.optimizer_adamw = torch.optim.AdamW(adam_params, lr=lr, weight_decay=0.01)
+        
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
+            self.optimizer_adamw,
             mode="min",
             factor=0.5,
             patience=3,
@@ -77,7 +89,7 @@ class MambaController(LearnerController, nn.Module):
 
     @property
     def current_lr(self) -> float:
-        return float(self.optimizer.param_groups[0]["lr"])
+        return float(self.optimizer_adamw.param_groups[0]["lr"])
 
     def get_config(self) -> Dict[str, Any]:
         return {
@@ -270,7 +282,8 @@ class MambaController(LearnerController, nn.Module):
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 batch_next = batch_next.to(self.device, non_blocking=True)
                 
-                self.optimizer.zero_grad(set_to_none=True)
+                self.optimizer_muon.zero_grad(set_to_none=True)
+                self.optimizer_adamw.zero_grad(set_to_none=True)
                 
                 normalized_obs = self._normalize_observations(batch_obs)
                 noisy_obs = normalized_obs.clone()
@@ -285,14 +298,17 @@ class MambaController(LearnerController, nn.Module):
 
                 if self.grad_scaler:
                     self.grad_scaler.scale(loss).backward()
-                    self.grad_scaler.unscale_(self.optimizer)
+                    self.grad_scaler.unscale_(self.optimizer_muon)
+                    self.grad_scaler.unscale_(self.optimizer_adamw)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.step(self.optimizer_muon)
+                    self.grad_scaler.step(self.optimizer_adamw)
                     self.grad_scaler.update()
                 else:
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.optimizer.step()
+                    self.optimizer_muon.step()
+                    self.optimizer_adamw.step()
 
                 total_loss += loss.item()
                 total_grad_norm += float(grad_norm)
@@ -323,7 +339,8 @@ class MambaController(LearnerController, nn.Module):
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "model_state_dict": self.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_muon_state_dict": self.optimizer_muon.state_dict(),
+            "optimizer_adamw_state_dict": self.optimizer_adamw.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": self.get_config(),
             "metadata": metadata,
@@ -334,8 +351,17 @@ class MambaController(LearnerController, nn.Module):
     def load_checkpoint(self, path: str, map_location: Optional[str] = None) -> Dict[str, Any]:
         checkpoint = torch.load(path, map_location=map_location or self.device, weights_only=False)
         self.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        # New split optimizer loading
+        if "optimizer_muon_state_dict" in checkpoint:
+            self.optimizer_muon.load_state_dict(checkpoint["optimizer_muon_state_dict"])
+        if "optimizer_adamw_state_dict" in checkpoint:
+            self.optimizer_adamw.load_state_dict(checkpoint["optimizer_adamw_state_dict"])
+            
+        # Legacy compatibility
+        if "optimizer_state_dict" in checkpoint and "optimizer_adamw_state_dict" not in checkpoint:
+            self.optimizer_adamw.load_state_dict(checkpoint["optimizer_state_dict"])
+            
         if "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.normalizer_fitted = bool(checkpoint.get("normalizer_fitted", True))
