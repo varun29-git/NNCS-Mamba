@@ -197,10 +197,19 @@ def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=60,
             
             y = plant.state.copy()
             traj = [y]
+            phase_idx = 0
             for _ in range(seq_steps):
-                u = mamba_ctrl.forward(y)
+                # Dynamically append target waypoint coordinates
+                target = CHECKPOINTS[phase_idx]
+                y_with_target = np.concatenate([y, target])
+                u = mamba_ctrl.forward(y_with_target)
                 y = plant.step(u, dt)
                 traj.append(y)
+                
+                # Check target visitation to advance phase during evaluation
+                if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
+                    phase_idx += 1
+                
                 
             score = check_stl_score(traj)
             samples.append(mock_state)
@@ -243,7 +252,10 @@ def fix_and_merge(failed_inits, expert_ctrl, plant, dataset, seq_steps=300, dt=0
         y = plant.state.copy()
         for _ in range(seq_steps):
             u = expert_ctrl.compute_action(y)
-            obs_seq.append(y)
+            target = CHECKPOINTS[expert_ctrl.phase_idx]
+            y_with_target = np.concatenate([y, target])
+            
+            obs_seq.append(y_with_target)
             act_seq.append(u)
             y = plant.step(u, dt)
             
@@ -280,7 +292,10 @@ def generate_expert_demonstrations(
         obs_seq, act_seq = [], []
         for _ in range(seq_steps):
             u = expert_ctrl.compute_action(y)
-            obs_seq.append(y)
+            target = CHECKPOINTS[expert_ctrl.phase_idx]
+            y_with_target = np.concatenate([y, target])
+            
+            obs_seq.append(y_with_target)
             act_seq.append(u)
             y = plant.step(u, dt)
 
@@ -288,7 +303,7 @@ def generate_expert_demonstrations(
     return dataset
 
 
-def build_sequence_loader(raw_list, batch_size=32, shuffle=False, num_workers=0, pin_memory=False):
+def build_sequence_loader(raw_list, batch_size=32, shuffle=False, num_workers=4, pin_memory=True):
     if not raw_list:
         return None
     obs = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
@@ -299,6 +314,7 @@ def build_sequence_loader(raw_list, batch_size=32, shuffle=False, num_workers=0,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=2 if num_workers > 0 else None
     )
 
 
@@ -307,8 +323,8 @@ def prepare_dataloaders(
     latest_demos,
     batch_size=32,
     val_split=0.15,
-    num_workers=0,
-    pin_memory=False,
+    num_workers=4,
+    pin_memory=True,
     shuffle=True,
 ):
     """
@@ -345,6 +361,7 @@ def prepare_dataloaders(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     val_loader = None
     if val_obs is not None:
@@ -354,6 +371,7 @@ def prepare_dataloaders(
             shuffle=False,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            prefetch_factor=2 if num_workers > 0 else None
         )
     
     return train_loader, val_loader
@@ -407,10 +425,15 @@ def run_validation_rollouts(
 
         mamba_ctrl.reset()
         traj = [y]
+        phase_idx = 0
         for _ in range(seq_steps):
-            u = mamba_ctrl.forward(y)
+            target = CHECKPOINTS[phase_idx]
+            y_with_target = np.concatenate([y, target])
+            u = mamba_ctrl.forward(y_with_target)
             y = plant.step(u, dt)
             traj.append(y)
+            if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
+                phase_idx += 1
 
         rollout_summaries.append(summarize_rollout(traj))
 
@@ -422,7 +445,7 @@ def run_validation_rollouts(
 
 
 def build_cegis_framework():
-    D_OBS, D_ACT = 12, 4
+    D_OBS, D_ACT = 15, 4
     SEQ_STEPS = 300  # 30 seconds — enough for A→B→C→Dock with mass decay
     DT = 0.1
     MAX_ITER = 10
@@ -452,8 +475,8 @@ def build_cegis_framework():
             dataset,
             latest_demos,
             batch_size=32,
-            num_workers=0,
-            pin_memory=mamba_ctrl.device.type == "cuda",
+            num_workers=4,
+            pin_memory=True, # Optimal since A100 setup
         )
         
         epochs = 5 if cycle == 1 else min(15, max(3, len(latest_demos)))

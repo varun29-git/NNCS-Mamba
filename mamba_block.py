@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
+from torch.utils.checkpoint import checkpoint
 
 class MambaCache:
     """
@@ -100,6 +101,16 @@ class MambaBlock(nn.Module):
         """
         x: [Batch, SeqLen, D_Model]
         """
+        if self.training and cache is None:
+            # Trade compute for memory using gradient checkpointing during parallel scan phase
+            # use_reentrant=False is the PyTorch >= 2.0 standard
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        return self._forward_impl(x, cache)
+
+    def _forward_impl(self, x: torch.Tensor, cache: Optional[MambaCache] = None):
+        """
+        x: [Batch, SeqLen, D_Model]
+        """
         batch, seq_len, _ = x.shape
         
         # 1. Input Projection
@@ -154,37 +165,47 @@ class MambaBlock(nn.Module):
         # A: [D_Inner, D_State]
         A = -torch.exp(self.A_log)
         
+        # Explicit FP32 casting to completely bypass AMP and prevent NaN/Inf overflow during exponentiation
+        dt_fp32 = dt.float()
+        A_fp32 = A.float()
+        B_fp32 = B.float()
+        C_fp32 = C.float()
+        x_fp32 = x.float()
+        
         if cache:
             # Sequential/Recurrent mode (Inference)
             # h: [B, D_Inner, D_State]
             # [B, D_Inner, D_State] * [B, D_Inner, 1] -> [B, D_Inner, D_State]
-            dA = torch.exp(dt.transpose(1, 2) * A)
-            dB = dt.transpose(1, 2) * B
+            dA = torch.exp(dt_fp32.transpose(1, 2) * A_fp32)
+            dB = dt_fp32.transpose(1, 2) * B_fp32
             
             # Recurrence
             # x: [B, 1, D_Inner] -> [B, D_Inner, 1]
-            new_h = dA * cache.h + dB * x.transpose(1, 2)
+            new_h = dA * cache.h.float() + dB * x_fp32.transpose(1, 2)
             cache.h.copy_(new_h)
             
             # [B, D_Inner, D_State] @ [B, D_State, 1] -> [B, D_Inner, 1]
-            y = torch.bmm(new_h, C.transpose(1, 2)).transpose(1, 2)
+            y = torch.bmm(new_h, C_fp32.transpose(1, 2)).transpose(1, 2)
         else:
             # Parallel mode (Training)
             # This is a simplified version of the associative scan using pre-broadcasted dA/dB
             # [B, L, D_Inner, D_State]
-            dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
-            dB = dt.unsqueeze(-1) * B.unsqueeze(-2)
+            dA = torch.exp(dt_fp32.unsqueeze(-1) * A_fp32.unsqueeze(0).unsqueeze(0))
+            dB = dt_fp32.unsqueeze(-1) * B_fp32.unsqueeze(-2)
             
             # Recurrent scan
-            h = torch.zeros(batch, d_inner, self.d_state, device=x.device)
+            h = torch.zeros(batch, d_inner, self.d_state, device=x.device, dtype=torch.float32)
             ys = []
             for t in range(seq_len):
-                h = dA[:, t] * h + dB[:, t] * x[:, t].unsqueeze(-1)
+                h = dA[:, t] * h + dB[:, t] * x_fp32[:, t].unsqueeze(-1)
                 # [B, D_Inner, D_State] @ [B, D_State, 1] -> [B, D_Inner, 1]
-                y_t = torch.bmm(h, C[:, t].unsqueeze(-1))
+                y_t = torch.bmm(h, C_fp32[:, t].unsqueeze(-1))
                 ys.append(y_t)
             
             y = torch.stack(ys, dim=1).squeeze(-1)
+
+        # Cast safely back to original precision (FP16 or FP32)
+        y = y.to(dtype=x.dtype)
 
         # Residual connection additive part (D)
         y = y + x * self.D

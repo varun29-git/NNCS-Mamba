@@ -261,7 +261,9 @@ class MambaController(LearnerController, nn.Module):
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 self.optimizer.zero_grad(set_to_none=True)
                 normalized_obs = self._normalize_observations(batch_obs)
-                noisy_obs = normalized_obs + torch.randn_like(normalized_obs) * self.noise_std
+                noisy_obs = normalized_obs.clone()
+                # Apply Gaussian noise to expert X/Y/Z positions (indices 0:3) to combat covariate shift
+                noisy_obs[..., 0:3] = noisy_obs[..., 0:3] + torch.randn_like(noisy_obs[..., 0:3]) * self.noise_std
 
                 # Safe autocast for PyTorch < 2.4/unified API
                 context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)

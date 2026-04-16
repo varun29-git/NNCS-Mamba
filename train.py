@@ -19,11 +19,16 @@ import argparse
 import json
 import numpy as np
 import torch
+import time
 from pathlib import Path
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
 
-from drone_env import DronePlant, DroneExpertController
+# Enable TF32 for optimal performance on A100 GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+from drone_env import DronePlant, DroneExpertController, CHECKPOINTS
 from mamba_learner import MambaController
 from cegis_loop import falsify_cem, fix_and_merge
 
@@ -31,7 +36,7 @@ from cegis_loop import falsify_cem, fix_and_merge
 # =============================================================================
 # Helper: CPU-Backed Dataloader (Prevents T4 OOM Errors)
 # =============================================================================
-def create_cpu_dataloaders(dataset, batch_size, val_split=0.15):
+def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=4):
     """Converts the list of trajectories into CPU-bound PyTorch DataLoaders."""
     data_list = list(dataset)
     np.random.shuffle(data_list)
@@ -52,8 +57,14 @@ def create_cpu_dataloaders(dataset, batch_size, val_split=0.15):
     train_ds = to_dataset(train_raw)
     val_ds = to_dataset(val_raw)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True) if val_ds else None
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, pin_memory=True,
+        num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, pin_memory=True,
+        num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None
+    ) if val_ds else None
 
     return train_loader, val_loader
 
@@ -80,7 +91,11 @@ def generate_expert_data(num_traj, seq_steps, dt):
         o_seq, a_seq = [], []
         for _ in range(seq_steps):
             u = expert.compute_action(y)
-            o_seq.append(y)
+            # Explicitly append target waypoint coordinates to input (Covariate Shift Fix)
+            target = CHECKPOINTS[expert.phase_idx]
+            y_with_target = np.concatenate([y, target])
+            
+            o_seq.append(y_with_target)
             a_seq.append(u)
             y = plant.step(u, dt)
 
@@ -104,7 +119,7 @@ def run_smoke(controller, args, outdir):
     print(f"Smoke Test Complete. Train Loss: {metrics['train_loss']:.4f} | Val Loss: {metrics['val_loss']:.4f}")
 
 
-def run_imitation(controller, args, outdir, dataset):
+def run_imitation(controller, args, outdir, dataset, global_start_time):
     """Pure imitation learning from expert demonstrations."""
     print("\n=== PHASE: BASELINE IMITATION ===")
     train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
@@ -114,6 +129,10 @@ def run_imitation(controller, args, outdir, dataset):
     csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
+        if time.time() - global_start_time > 9.5 * 3600:
+            print("[!] Time limit reached (9.5 hours). Gracefully exiting Imitation Phase...")
+            break
+            
         metrics = controller.update(
             train_loader, val_loader,
             epochs=1,
@@ -139,7 +158,7 @@ def run_imitation(controller, args, outdir, dataset):
     return outdir / "best_imitation.pt"
 
 
-def run_cegis(controller, args, outdir, dataset):
+def run_cegis(controller, args, outdir, dataset, global_start_time):
     """CEGIS refinement — falsify, fix, retrain."""
     print("\n=== PHASE: CEGIS REFINEMENT ===")
 
@@ -151,6 +170,10 @@ def run_cegis(controller, args, outdir, dataset):
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
 
     for cycle in range(1, args.cegis_cycles + 1):
+        if time.time() - global_start_time > 9.5 * 3600:
+            print("[!] Time limit reached (9.5 hours). Gracefully exiting CEGIS Phase...")
+            break
+        
         print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
 
         # 1. Hunt for failures
@@ -220,6 +243,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
+    
+    global_start_time = time.time()
 
     # Setup
     np.random.seed(args.seed)
@@ -236,12 +261,24 @@ def main():
 
     # Initialize Controller
     print("[*] Initializing Mamba Controller...")
+    # Increase obs_dim to 15 to account for concatenated target coordinates (12D state + 3D target)
     controller = MambaController(
-        obs_dim=12, action_dim=4,
+        obs_dim=15, action_dim=4,
         d_model=args.d_model, d_state=args.d_state,
         num_layers=args.layers, lr=args.lr,
     )
     print(f"    Device: {controller.device}")
+
+    # A100 Kernel Fusion (requires PyTorch >= 2.0 and CUDA)
+    if torch.cuda.is_available():
+        try:
+            controller._forward_sequence_from_normalized = torch.compile(
+                controller._forward_sequence_from_normalized, 
+                mode="reduce-overhead"
+            )
+            print("[*] Enabled Kernel Fusion (torch.compile) for forward sequence.")
+        except Exception as e:
+            print(f"[!] torch.compile failed: {e}")
 
     if args.resume:
         print(f"[*] Resuming from checkpoint: {args.resume}")
@@ -279,18 +316,18 @@ def main():
 
     # ── Imitation ──
     if args.phase == "imitation":
-        run_imitation(controller, args, outdir, dataset)
+        run_imitation(controller, args, outdir, dataset, global_start_time)
         return
 
     # ── CEGIS ──
     if args.phase == "cegis":
         # If resuming for CEGIS, we might not need to harvest if we just want to hunt
-        run_cegis(controller, args, outdir, dataset)
+        run_cegis(controller, args, outdir, dataset, global_start_time)
         return
 
     # ── All: Imitation → CEGIS ──
-    run_imitation(controller, args, outdir, dataset)
-    run_cegis(controller, args, outdir, dataset)
+    run_imitation(controller, args, outdir, dataset, global_start_time)
+    run_cegis(controller, args, outdir, dataset, global_start_time)
 
 
 if __name__ == "__main__":
