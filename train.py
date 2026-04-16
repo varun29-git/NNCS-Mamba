@@ -180,12 +180,12 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         print("[*] Falsifier hunting for edge cases...")
         failures = falsify_cem(
             controller, plant, expert,
-            pop_size=20, seq_steps=args.seq_steps, dt=0.1,
+            pop_size=10000, seq_steps=args.seq_steps, dt=0.1,
         )
 
         num_fails = len(failures)
-        coverage = (1.0 - min(1.0, num_fails / 60.0)) * 100
-        print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.1f}%")
+        coverage = (1.0 - min(1.0, num_fails / 10000.0)) * 100
+        print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.2f}%")
 
         if num_fails == 0:
             print("\n✔️  CEGIS Converged! 100% Safety Coverage achieved.")

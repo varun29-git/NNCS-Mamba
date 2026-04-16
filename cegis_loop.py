@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
-from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
+from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS, compute_drone_derivatives
 from mamba_learner import MambaController
 
 
@@ -165,68 +165,87 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     print(f"-> Trajectory plot saved: {filename}")
 
 
-def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=60, 
+def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=10000, 
                 elite_frac=0.2, seq_steps=300, dt=0.1):
     """
-    CEM Falsifier adapted for the multi-checkpoint environment.
-    Samples initial states spread across the wider 3D checkpoint volume.
+    Massively Scaled CEM Falsifier adapted for the multi-checkpoint environment.
+    Runs pop_size drones simultaneously entirely on the GPU via torch.vmap.
     """
     mamba_ctrl.eval()
     failed_inits = []
     
-    # Initial distribution centered near typical spawn region
-    mu = np.zeros(12)
-    mu[0:3] = [3.0, 0.0, 15.0]  # Near checkpoint A's altitude
-    sigma = np.ones(12) * 5.0
-    sigma[3:6] = 0.3  # Keep attitudes reasonable
+    device = mamba_ctrl.device
+    mu = torch.zeros(12, dtype=torch.float32, device=device)
+    mu[0:3] = torch.tensor([3.0, 0.0, 15.0], device=device)
+    sigma = torch.ones(12, dtype=torch.float32, device=device) * 5.0
+    sigma[3:6] = 0.3
+    
+    vmap_derivatives = torch.vmap(compute_drone_derivatives, in_dims=(0, 0, 0, 0, None), randomness="different")
+    checkpoints_tensor = torch.tensor(CHECKPOINTS, dtype=torch.float32, device=device)
     
     for gen in range(num_generations):
-        samples = []
-        scores = []
+        # 1. Spawn adversarial states on GPU
+        states = torch.normal(mu.expand(pop_size, -1), sigma.expand(pop_size, -1))
+        # Keep initial boundaries somewhat reasonable (prevents spawning underground)
+        states[:, 0:3] = torch.clamp(states[:, 0:3], -15.0, 15.0)
+        states[:, 2] = torch.clamp(states[:, 2], 5.0, 22.0)
+        states[:, 3:6] = torch.clamp(states[:, 3:6], -0.8, 0.8)
         
-        for _ in range(pop_size):
-            mock_state = np.random.normal(mu, sigma)
-            mock_state[0:3] = np.clip(mock_state[0:3], -15, 15)
-            mock_state[2] = np.clip(mock_state[2], 5, 22)  # Keep z positive and high
-            mock_state[3:6] = np.clip(mock_state[3:6], -0.8, 0.8)
+        initial_states = states.clone()
+        
+        # 2. Parallel state tracking bindings
+        times = torch.zeros(pop_size, dtype=torch.float32, device=device)
+        phase_idxs = torch.zeros(pop_size, dtype=torch.long, device=device)
+        
+        mamba_ctrl.reset(max_batch_size=pop_size)
+        traj_states = [states.clone()]
+        
+        # 3. Vectorized rollout loop
+        for _ in range(seq_steps):
+            targets = checkpoints_tensor[phase_idxs]
+            inputs = torch.cat([states, targets], dim=-1)
             
-            plant.reset()
-            plant.state = mock_state.copy()
-            plant.time = 0.0
-            mamba_ctrl.reset()
+            obs_tensor = inputs.unsqueeze(1) # [B, 1, 15]
             
-            y = plant.state.copy()
-            traj = [y]
-            phase_idx = 0
-            for _ in range(seq_steps):
-                # Dynamically append target waypoint coordinates
-                target = CHECKPOINTS[phase_idx]
-                y_with_target = np.concatenate([y, target])
-                u = mamba_ctrl.forward(y_with_target)
-                y = plant.step(u, dt)
-                traj.append(y)
-                
-                # Check target visitation to advance phase during evaluation
-                if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
-                    phase_idx += 1
-                
-                
-            score = check_stl_score(traj)
-            samples.append(mock_state)
+            with torch.no_grad():
+                u = mamba_ctrl._run_cached_step(obs_tensor).squeeze(1) # [B, 4]
+            u = torch.clamp(u, -20.0, 20.0)
+            
+            # Vectorized plant step
+            # Dynamic hidden mass equation: max(1.0, 2.5 - 0.02 * time)
+            masses = torch.clamp(2.5 - 0.02 * times, min=1.0)
+            
+            derivatives = vmap_derivatives(states, u, times, masses, 9.81)
+            states = states + derivatives * dt
+            times = times + dt
+            
+            # Advance logical phase tracking cleanly
+            dists = torch.norm(states[:, 0:3] - targets, dim=-1)
+            phase_idxs = torch.where((dists < CHECKPOINT_RADIUS) & (phase_idxs < 3), phase_idxs + 1, phase_idxs)
+            
+            traj_states.append(states.clone())
+            
+        # 4. Export massive tensor directly to CPU list evaluation parsing
+        rollouts = torch.stack(traj_states, dim=1).cpu().numpy() # [B, L, 12]
+        samples_cpu = initial_states.cpu().numpy()
+        
+        scores = []
+        for i in range(pop_size):
+            score = check_stl_score(rollouts[i])
             scores.append(score)
-            
             if score < 0.0:
-                failed_inits.append(mock_state.copy())
+                failed_inits.append(samples_cpu[i].copy())
                 
-        # CEM elite update
+        # 5. Elite CEM Parameter Update
         sorted_indices = np.argsort(scores)
         n_elites = max(1, int(pop_size * elite_frac))
-        elites = np.array(samples)[sorted_indices[:n_elites]]
+        elites = samples_cpu[sorted_indices[:n_elites]]
         
-        mu = np.mean(elites, axis=0)
-        sigma = np.std(elites, axis=0) + 0.1
+        # Pull statistics back down into the GPU generator core
+        mu = torch.tensor(np.mean(elites, axis=0), dtype=torch.float32, device=device)
+        sigma = torch.tensor(np.std(elites, axis=0) + 0.1, dtype=torch.float32, device=device)
             
-    # Deduplicate
+    # Deduplicate unique failure traps cleanly
     unique_fails = []
     for f in failed_inits:
         if not any(np.allclose(f, uf, atol=1.0) for uf in unique_fails):

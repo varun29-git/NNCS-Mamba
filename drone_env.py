@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 import math
 from abstract_env import Plant, ExpertController
 
@@ -152,3 +153,49 @@ class DroneExpertController(ExpertController):
         force_cmd = np.clip(force_cmd, -15.0, 15.0)
         
         return np.array([force_cmd[0], force_cmd[1], force_cmd[2], 0.0])
+
+
+# ==============================================================================
+# PyTorch Functional Physics (For VMAP Acceleration)
+# ==============================================================================
+def compute_drone_derivatives(state: torch.Tensor, u: torch.Tensor, time_t: torch.Tensor, mass: torch.Tensor, gravity: float):
+    """
+    Pure PyTorch functional kernel to compute 12D drone derivatives.
+    Compatible with torch.vmap for massive batch parallel processing.
+    """
+    u_clipped = torch.clamp(u, -20.0, 20.0)
+    Fx_cmd, Fy_cmd, Fz_cmd, yaw_rate_cmd = u_clipped[0], u_clipped[1], u_clipped[2], u_clipped[3]
+    
+    ax_cmd = Fx_cmd / mass
+    ay_cmd = Fy_cmd / mass
+    az_cmd = Fz_cmd / mass
+    
+    # Wind gust logic explicitly formulated for tensor conditioning
+    wind_condition = torch.sin(2 * torch.pi * time_t / 5.0) > 0.8
+    wind_gust = torch.where(wind_condition, 5.0 / mass, torch.zeros_like(mass))
+    
+    # Explode state
+    phi, theta, psi = state[3], state[4], state[5]
+    vx, vy, vz = state[6], state[7], state[8]
+    p, q, r = state[9], state[10], state[11]
+    
+    # Derivatives
+    dx, dy, dz = vx, vy, vz
+    dphi, dtheta, dpsi = p, q, r
+    
+    dvx = gravity * theta + wind_gust + ax_cmd
+    dvy = -gravity * phi + ay_cmd
+    dvz = az_cmd - gravity
+    
+    dp = -10.0 * phi - 2.0 * p
+    dq = -10.0 * theta - 2.0 * q
+    dr = yaw_rate_cmd
+    
+    noise = torch.randn(12, device=state.device, dtype=state.dtype) * 0.05
+    
+    derivatives = torch.stack([
+        dx, dy, dz, dphi, dtheta, dpsi,
+        dvx, dvy, dvz, dp, dq, dr
+    ]) + noise
+    
+    return derivatives
