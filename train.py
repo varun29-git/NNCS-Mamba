@@ -140,8 +140,8 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
     csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
-        if time.time() - global_start_time > 9.5 * 3600:
-            print("[!] Time limit reached (9.5 hours). Gracefully exiting Imitation Phase...")
+        if time.time() - global_start_time > 14.0 * 3600:
+            print("[!] Time limit reached (14 hours). Gracefully exiting Imitation Phase...")
             break
             
         metrics = controller.update(
@@ -183,8 +183,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
 
     for cycle in range(1, args.cegis_cycles + 1):
-        if time.time() - global_start_time > 9.5 * 3600:
-            print("[!] Time limit reached (9.5 hours). Gracefully exiting CEGIS Phase...")
+        if time.time() - global_start_time > 14.0 * 3600:
+            print("[!] Time limit reached (14 hours). Gracefully exiting CEGIS Phase...")
             break
         
         print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--d-state", type=int, default=32)
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=128)
 
     # Data & Training
     parser.add_argument("--num-traj", type=int, default=15000)
@@ -290,16 +290,9 @@ def main():
     )
     print(f"    Device: {controller.device}")
 
-    # A100 Kernel Fusion (requires PyTorch >= 2.0 and CUDA)
-    if torch.cuda.is_available():
-        try:
-            controller._forward_sequence_from_normalized = torch.compile(
-                controller._forward_sequence_from_normalized, 
-                mode="reduce-overhead"
-            )
-            print("[*] Enabled Kernel Fusion (torch.compile) for forward sequence.")
-        except Exception as e:
-            print(f"[!] torch.compile failed: {e}")
+    # NOTE: torch.compile disabled — CUDA Graphs consume ~1.2GB extra VRAM
+    # which causes OOM on A100 MIG 3g.20gb (19.5GB) slices. The sequential
+    # for-loop in selective_scan causes graph breaks anyway, negating benefits.
 
     if args.resume:
         print(f"[*] Resuming from checkpoint: {args.resume}")
@@ -318,7 +311,7 @@ def main():
     if cache_path.exists() and args.num_traj > 0:
         print(f"[*] Loading cached baseline dataset from {cache_path}...")
         try:
-            cached_data = torch.load(cache_path, weights_only=True)
+            cached_data = torch.load(cache_path, weights_only=False)
             # If the user requested a different number of trajectories, adjust
             if len(cached_data) > args.num_traj:
                 cached_data = cached_data[:args.num_traj]
