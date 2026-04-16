@@ -249,10 +249,10 @@ def main():
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
-    # Hyperparameters (Conservative — guaranteed fit on A100 MIG 3g.20gb)
-    parser.add_argument("--d-model", type=int, default=256)
+    # Hyperparameters ('Sweet Spot' — Safe & Expressive for 20GB A100 MIG)
+    parser.add_argument("--d-model", type=int, default=384)
     parser.add_argument("--d-state", type=int, default=16)
-    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=64)
 
