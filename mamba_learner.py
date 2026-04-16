@@ -52,7 +52,8 @@ class MambaController(LearnerController, nn.Module):
             nn.LayerNorm(d_model) for _ in range(num_layers)
         ])
         
-        self.output_layer = nn.Linear(d_model, action_dim)
+        self.action_head = nn.Linear(d_model, action_dim)
+        self.state_head = nn.Linear(d_model, 12)  # Explicit 12D predictive physics engine
         
         # Internal state caches for step-by-step inference
         self.layer_caches = []
@@ -106,6 +107,17 @@ class MambaController(LearnerController, nn.Module):
         if not self.layer_caches:
             self.reset(max_batch_size=self.max_batch_size)
 
+    def _forward_sequence(self, batch_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized_obs = self._normalize_observations(batch_obs)
+        return self._forward_sequence_from_normalized(normalized_obs)
+
+    def _forward_sequence_from_normalized(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self._encode_normalized_inputs(x)
+        for block, norm in zip(self.mamba_blocks, self.norms):
+            # Parallel scan during training (cache=None triggers parallel computation)
+            x = x + block(norm(x), cache=None)
+        return self.action_head(x), self.state_head(x)
+
     def _encode_inputs(self, batch_obs: torch.Tensor) -> torch.Tensor:
         normalized_obs = self._normalize_observations(batch_obs)
         return self._encode_normalized_inputs(normalized_obs)
@@ -129,7 +141,7 @@ class MambaController(LearnerController, nn.Module):
         feature_sq_sum = torch.zeros(self.obs_dim, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            for batch_obs, _ in loader:
+            for batch_obs, _, _ in loader:
                 batch_obs = batch_obs.to(self.device, non_blocking=self.device.type == "cuda")
                 flat_obs = batch_obs.reshape(-1, self.obs_dim)
                 feature_sum += flat_obs.sum(dim=0)
@@ -151,7 +163,7 @@ class MambaController(LearnerController, nn.Module):
         x = self._encode_inputs(obs_tensor)
         for block, norm, cache in zip(self.mamba_blocks, self.norms, self.layer_caches):
             x = x + block(norm(x), cache=cache)
-        return self.output_layer(x)
+        return self.action_head(x)
         
     def forward(self, y: np.ndarray) -> np.ndarray:
         """
@@ -192,11 +204,6 @@ class MambaController(LearnerController, nn.Module):
             pin_memory=pin_memory,
         )
 
-    def _forward_sequence(self, batch_obs: torch.Tensor) -> torch.Tensor:
-        x = self._encode_inputs(batch_obs)
-        for block, norm in zip(self.mamba_blocks, self.norms):
-            x = x + block(norm(x))
-        return self.output_layer(x)
 
     def _evaluate_loader(self, loader: Optional[DataLoader]) -> float:
         if loader is None:
@@ -207,13 +214,15 @@ class MambaController(LearnerController, nn.Module):
         batches_processed = 0
 
         with torch.no_grad():
-            for batch_obs, batch_act in loader:
+            for batch_obs, batch_act, batch_next in loader:
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
+                batch_next = batch_next.to(self.device, non_blocking=True)
                 # Safe autocast for PyTorch < 2.4/unified API
                 context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode()
                 with context:
-                    predictions = self._forward_sequence(batch_obs)
-                    loss = self.criterion(predictions, batch_act)
+                    pred_act, pred_next = self._forward_sequence(batch_obs)
+                    # 0.5 Weighting for physics projection relative to imitation
+                    loss = self.criterion(pred_act, batch_act) + 0.5 * self.criterion(pred_next, batch_next)
                 total_loss += loss.item()
                 batches_processed += 1
 
@@ -257,9 +266,12 @@ class MambaController(LearnerController, nn.Module):
         total_grad_norm = 0.0
 
         for _ in range(epochs):
-            for batch_obs, batch_act in train_loader:
+            for batch_obs, batch_act, batch_next in train_loader:
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
+                batch_next = batch_next.to(self.device, non_blocking=True)
+                
                 self.optimizer.zero_grad(set_to_none=True)
+                
                 normalized_obs = self._normalize_observations(batch_obs)
                 noisy_obs = normalized_obs.clone()
                 # Apply Gaussian noise to expert X/Y/Z positions (indices 0:3) to combat covariate shift
@@ -268,8 +280,8 @@ class MambaController(LearnerController, nn.Module):
                 # Safe autocast for PyTorch < 2.4/unified API
                 context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
                 with context:
-                    predictions = self._forward_sequence_from_normalized(noisy_obs)
-                    loss = self.criterion(predictions, batch_act)
+                    pred_act, pred_next = self._forward_sequence_from_normalized(noisy_obs)
+                    loss = self.criterion(pred_act, batch_act) + 0.5 * self.criterion(pred_next, batch_next)
 
                 if self.grad_scaler:
                     self.grad_scaler.scale(loss).backward()
@@ -304,11 +316,7 @@ class MambaController(LearnerController, nn.Module):
             "epochs": float(epochs),
         }
 
-    def _forward_sequence_from_normalized(self, normalized_obs: torch.Tensor) -> torch.Tensor:
-        x = self._encode_normalized_inputs(normalized_obs)
-        for block, norm in zip(self.mamba_blocks, self.norms):
-            x = x + block(norm(x))
-        return self.output_layer(x)
+
 
     def save_checkpoint(self, path: str, **metadata: Any) -> None:
         checkpoint_path = Path(path)

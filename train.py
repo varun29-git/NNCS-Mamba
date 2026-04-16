@@ -50,9 +50,20 @@ def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=4):
             return None
         # KEEP ON CPU: Do not use device='cuda' here!
         # The MambaController will move batches to GPU during training.
-        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
-        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
-        return TensorDataset(o, a)
+        o_np = np.stack([x[0] for x in raw_list])
+        a_np = np.stack([x[1] for x in raw_list])
+        
+        o = torch.tensor(o_np, dtype=torch.float32)
+        a = torch.tensor(a_np, dtype=torch.float32)
+        
+        # Sequentially map input causality
+        o_in = o[:, :-1, :]
+        a_in = a[:, :-1, :]
+        
+        # Target isolation (Extract 12D continuous physics parameters representing the literal t+1 step)
+        next_o = o[:, 1:, 0:12]
+        
+        return TensorDataset(o_in, a_in, next_o)
 
     train_ds = to_dataset(train_raw)
     val_ds = to_dataset(val_raw)
@@ -165,6 +176,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
     plant = DronePlant()
     expert = DroneExpertController()
     expert.set_plant_ref(plant)
+    
+    cegis_buffer = []
 
     csv_log = open(outdir / "cegis_log.csv", "w")
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
@@ -194,11 +207,19 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
         # 2. Expert Intervention
         print("[*] Generating expert corrections...")
-        fix_and_merge(failures, expert, plant, dataset, args.seq_steps, 0.1)
+        fix_and_merge(failures, expert, plant, cegis_buffer, args.seq_steps, 0.1)
 
-        # 3. Retrain
-        print(f"[*] Retraining on updated dataset (Size: {len(dataset)})...")
-        train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
+        # 3. Retrain (Prioritized Experience Replay)
+        target_cegis_size = int(len(dataset) * (0.3 / 0.7))
+        if len(cegis_buffer) > 0:
+            import random
+            upsampled_cegis = random.choices(cegis_buffer, k=target_cegis_size)
+            mixed_dataset = dataset + upsampled_cegis
+        else:
+            mixed_dataset = dataset
+
+        print(f"[*] Retraining PER (Size: {len(mixed_dataset)} | Baseline: {len(dataset)} | Recovery: {len(mixed_dataset)-len(dataset)})...")
+        train_loader, val_loader = create_cpu_dataloaders(mixed_dataset, args.batch_size)
         metrics = controller.update(
             train_loader, val_loader,
             epochs=5,
