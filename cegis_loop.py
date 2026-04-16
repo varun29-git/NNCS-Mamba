@@ -530,10 +530,15 @@ def build_cegis_framework():
         mamba_ctrl.reset()
         m_traj = []
         y = drone_plant.state.copy()
+        phase_idx = 0
         for _ in range(SEQ_STEPS):
-            u = mamba_ctrl.forward(y)
+            target = CHECKPOINTS[phase_idx]
+            y_with_target = np.concatenate([y, target])
+            u = mamba_ctrl.forward(y_with_target)
             y = drone_plant.step(u, DT)
             m_traj.append(y)
+            if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
+                phase_idx += 1
             
         # Expert trajectory (same init)
         drone_plant.reset()

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from drone_env import DronePlant, DroneExpertController
+from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
 from mamba_learner import MambaController
 from cegis_loop import (
     check_stl_score,
@@ -32,8 +32,8 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Load model
-    controller = MambaController(obs_dim=12, action_dim=4, d_model=64, d_state=16, num_layers=2)
+    # Load model (must match training architecture: 15D input, 512-dim, 6 layers)
+    controller = MambaController(obs_dim=15, action_dim=4, d_model=512, d_state=32, num_layers=6)
     checkpoint = controller.load_checkpoint(args.checkpoint)
     meta = checkpoint.get("metadata", {})
     print(f"Loaded: {args.checkpoint}")
@@ -56,15 +56,20 @@ def main():
     print(f"  Avg final distance to dock:  {metrics['avg_final_distance']:.2f} m")
     print(f"  Avg checkpoints reached:     {metrics['avg_checkpoints_reached']:.1f} / 3")
 
-    # STL robustness on a single trajectory
+    # STL robustness on a single trajectory (with 15D target concatenation)
     plant.reset()
     controller.reset()
     y = plant.state.copy()
     traj = [y]
+    phase_idx = 0
     for _ in range(args.seq_steps):
-        u = controller.forward(y)
+        target = CHECKPOINTS[phase_idx]
+        y_with_target = np.concatenate([y, target])
+        u = controller.forward(y_with_target)
         y = plant.step(u, args.dt)
         traj.append(y)
+        if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
+            phase_idx += 1
     stl = check_stl_score(traj)
     print(f"  STL robustness (1 traj):     {stl:.3f} {'✓' if stl > 0 else '✗'}")
 
@@ -74,15 +79,20 @@ def main():
         expert = DroneExpertController()
         expert.set_plant_ref(plant)
 
-        # Mamba trajectory
+        # Mamba trajectory (15D input with phase tracking)
         plant.state = init_state.copy()
         plant.time = 0.0
         controller.reset()
         m_traj, y = [], plant.state.copy()
+        phase_idx = 0
         for _ in range(args.seq_steps):
-            u = controller.forward(y)
+            target = CHECKPOINTS[phase_idx]
+            y_with_target = np.concatenate([y, target])
+            u = controller.forward(y_with_target)
             y = plant.step(u, args.dt)
             m_traj.append(y)
+            if phase_idx < 3 and np.linalg.norm(y[0:3] - target) < CHECKPOINT_RADIUS:
+                phase_idx += 1
 
         # Expert trajectory (same init)
         plant.state = init_state.copy()
