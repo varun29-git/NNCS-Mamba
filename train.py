@@ -69,6 +69,11 @@ def generate_expert_data(num_traj, seq_steps, dt):
 
     for i in range(num_traj):
         y = plant.reset()
+        # Randomize start-time to simulate partially burned fuel (Low-Mass training)
+        if np.random.rand() > 0.5:
+            plant.time = np.random.uniform(0.0, 60.0) 
+            y = plant.state.copy()
+            
         expert.reset()
         expert.set_plant_ref(plant)
 
@@ -201,16 +206,16 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
     # Hyperparameters
-    parser.add_argument("--d-model", type=int, default=64)
+    parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=16)
-    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=32)
 
     # Data & Training
     parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--cegis-cycles", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
 

@@ -69,7 +69,10 @@ class MambaController(LearnerController, nn.Module):
         )
         self.criterion = nn.MSELoss()
         self.use_amp = self.device.type == "cuda"
-        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        if self.use_amp:
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        else:
+            self.grad_scaler = None
 
     @property
     def current_lr(self) -> float:
@@ -206,7 +209,9 @@ class MambaController(LearnerController, nn.Module):
         with torch.no_grad():
             for batch_obs, batch_act in loader:
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                # Safe autocast for PyTorch < 2.4/unified API
+                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode()
+                with context:
                     predictions = self._forward_sequence(batch_obs)
                     loss = self.criterion(predictions, batch_act)
                 total_loss += loss.item()
@@ -258,15 +263,22 @@ class MambaController(LearnerController, nn.Module):
                 normalized_obs = self._normalize_observations(batch_obs)
                 noisy_obs = normalized_obs + torch.randn_like(normalized_obs) * self.noise_std
 
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                # Safe autocast for PyTorch < 2.4/unified API
+                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
+                with context:
                     predictions = self._forward_sequence_from_normalized(noisy_obs)
                     loss = self.criterion(predictions, batch_act)
 
-                self.grad_scaler.scale(loss).backward()
-                self.grad_scaler.unscale_(self.optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
+                if self.grad_scaler:
+                    self.grad_scaler.scale(loss).backward()
+                    self.grad_scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
+                    self.optimizer.step()
 
                 total_loss += loss.item()
                 total_grad_norm += float(grad_norm)

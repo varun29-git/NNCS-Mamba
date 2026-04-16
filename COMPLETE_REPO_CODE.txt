@@ -130,7 +130,6 @@ import numpy as np
 import torch
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
-import matplotlib.pyplot as plt
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
 from mamba_learner import MambaController
 
@@ -237,6 +236,8 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     """
     Enhanced 4-panel trajectory comparison with checkpoint markers.
     """
+    import matplotlib.pyplot as plt
+
     mamba_pos = np.array([y[0:3] for y in mamba_traj])
     expert_pos = np.array([y[0:3] for y in expert_traj])
     
@@ -292,7 +293,7 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     print(f"-> Trajectory plot saved: {filename}")
 
 
-def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=2, pop_size=30, 
+def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=60, 
                 elite_frac=0.2, seq_steps=300, dt=0.1):
     """
     CEM Falsifier adapted for the multi-checkpoint environment.
@@ -381,7 +382,63 @@ def fix_and_merge(failed_inits, expert_ctrl, plant, dataset, seq_steps=300, dt=0
     return latest_demonstrations
 
 
-def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
+def generate_expert_demonstrations(
+    plant,
+    expert_ctrl,
+    num_trajectories=2000,
+    seq_steps=300,
+    dt=0.1,
+    initial_states=None,
+):
+    """
+    Generate expert trajectories for baseline imitation training.
+    """
+    dataset = []
+    for idx in range(num_trajectories):
+        if initial_states is None:
+            y = plant.reset()
+        else:
+            plant.reset()
+            plant.state = initial_states[idx].copy()
+            plant.time = 0.0
+            y = plant.state.copy()
+
+        expert_ctrl.reset()
+        expert_ctrl.set_plant_ref(plant)
+        obs_seq, act_seq = [], []
+        for _ in range(seq_steps):
+            u = expert_ctrl.compute_action(y)
+            obs_seq.append(y)
+            act_seq.append(u)
+            y = plant.step(u, dt)
+
+        dataset.append((np.asarray(obs_seq, dtype=np.float32), np.asarray(act_seq, dtype=np.float32)))
+    return dataset
+
+
+def build_sequence_loader(raw_list, batch_size=32, shuffle=False, num_workers=0, pin_memory=False):
+    if not raw_list:
+        return None
+    obs = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+    act = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
+    return DataLoader(
+        TensorDataset(obs, act),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def prepare_dataloaders(
+    dataset,
+    latest_demos,
+    batch_size=32,
+    val_split=0.15,
+    num_workers=0,
+    pin_memory=False,
+    shuffle=True,
+):
     """
     Build train/val DataLoaders with 50/50 oversampling of latest failure demonstrations.
     """
@@ -395,8 +452,8 @@ def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
     def to_tensors(raw_list):
         if not raw_list:
             return None, None
-        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32, device=device)
-        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32, device=device)
+        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
         return o, a
 
     train_obs, train_act = to_tensors(train_raw)
@@ -410,10 +467,86 @@ def prepare_dataloaders(dataset, latest_demos, device, val_split=0.15):
             train_obs = torch.cat([train_obs, ld_obs.repeat(repeat_count, 1, 1)], dim=0)
             train_act = torch.cat([train_act, ld_act.repeat(repeat_count, 1, 1)], dim=0)
         
-    train_loader = DataLoader(TensorDataset(train_obs, train_act), batch_size=8, shuffle=True)
-    val_loader = DataLoader(TensorDataset(val_obs, val_act), batch_size=8) if val_obs is not None else None
+    train_loader = DataLoader(
+        TensorDataset(train_obs, train_act),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = None
+    if val_obs is not None:
+        val_loader = DataLoader(
+            TensorDataset(val_obs, val_act),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
     
     return train_loader, val_loader
+
+
+def summarize_rollout(trajectory_y, checkpoint_radius=CHECKPOINT_RADIUS, dock_radius=2.0):
+    positions = np.asarray(trajectory_y)[:, 0:3]
+    checkpoints_reached = 0
+    for checkpoint in CHECKPOINTS[:3]:
+        if np.any(np.linalg.norm(positions - checkpoint, axis=1) < checkpoint_radius):
+            checkpoints_reached += 1
+        else:
+            break
+
+    final_distance = float(np.linalg.norm(positions[-1] - CHECKPOINTS[-1]))
+    docked = bool(final_distance <= dock_radius)
+    return {
+        "checkpoints_reached": checkpoints_reached,
+        "checkpoint_order_success": float(checkpoints_reached == 3),
+        "docking_success": float(docked),
+        "final_distance": final_distance,
+    }
+
+
+def run_validation_rollouts(
+    mamba_ctrl,
+    plant,
+    num_missions=5,
+    seq_steps=300,
+    dt=0.1,
+    initial_states=None,
+):
+    metrics = {
+        "checkpoint_order_success_rate": 0.0,
+        "docking_success_rate": 0.0,
+        "avg_final_distance": 0.0,
+        "avg_checkpoints_reached": 0.0,
+    }
+    if num_missions <= 0:
+        return metrics
+
+    rollout_summaries = []
+    for mission_idx in range(num_missions):
+        if initial_states is None:
+            y = plant.reset()
+        else:
+            plant.reset()
+            plant.state = initial_states[mission_idx].copy()
+            plant.time = 0.0
+            y = plant.state.copy()
+
+        mamba_ctrl.reset()
+        traj = [y]
+        for _ in range(seq_steps):
+            u = mamba_ctrl.forward(y)
+            y = plant.step(u, dt)
+            traj.append(y)
+
+        rollout_summaries.append(summarize_rollout(traj))
+
+    metrics["checkpoint_order_success_rate"] = float(np.mean([x["checkpoint_order_success"] for x in rollout_summaries]))
+    metrics["docking_success_rate"] = float(np.mean([x["docking_success"] for x in rollout_summaries]))
+    metrics["avg_final_distance"] = float(np.mean([x["final_distance"] for x in rollout_summaries]))
+    metrics["avg_checkpoints_reached"] = float(np.mean([x["checkpoints_reached"] for x in rollout_summaries]))
+    return metrics
 
 
 def build_cegis_framework():
@@ -422,7 +555,7 @@ def build_cegis_framework():
     DT = 0.1
     MAX_ITER = 10
     
-    mamba_ctrl = MambaController(obs_dim=D_OBS, action_dim=D_ACT, d_model=64, d_state=16, num_layers=2, lr=3e-4)
+    mamba_ctrl = MambaController(obs_dim=D_OBS, action_dim=D_ACT, d_model=128, d_state=16, num_layers=3, lr=3e-4)
     drone_plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
     expert_ctrl = DroneExpertController()
     expert_ctrl.set_plant_ref(drone_plant)
@@ -443,16 +576,31 @@ def build_cegis_framework():
         print(f"--- Iteration {cycle}/{MAX_ITER} ---")
         print(f"{'='*50}")
         
-        train_loader, val_loader = prepare_dataloaders(dataset, latest_demos, mamba_ctrl.device)
+        train_loader, val_loader = prepare_dataloaders(
+            dataset,
+            latest_demos,
+            batch_size=32,
+            num_workers=0,
+            pin_memory=mamba_ctrl.device.type == "cuda",
+        )
         
         epochs = 5 if cycle == 1 else min(15, max(3, len(latest_demos)))
-        t_loss, v_loss = mamba_ctrl.update(train_loader, val_loader, epochs=epochs)
-        print(f"-> Train MSE: {t_loss:.4f} | Val MSE: {v_loss:.4f} | Dataset: {len(dataset)}")
+        metrics = mamba_ctrl.update(
+            train_loader,
+            val_loader,
+            epochs=epochs,
+            fit_normalizer=cycle == 1 and not mamba_ctrl.normalizer_fitted,
+        )
+        print(
+            f"-> Train MSE: {metrics['train_loss']:.4f} | "
+            f"Val MSE: {metrics['val_loss']:.4f} | "
+            f"Dataset: {len(dataset)}"
+        )
         
         # Falsification
         print("-> Running CEM Falsifier (multi-checkpoint + mass decay)...")
         failures = falsify_cem(mamba_ctrl, drone_plant, expert_ctrl,
-                              num_generations=1, pop_size=20, seq_steps=SEQ_STEPS, dt=DT)
+                               num_generations=1, pop_size=20, seq_steps=SEQ_STEPS, dt=DT)
         num_fails = len(failures)
         
         coverage = (1.0 - min(1.0, num_fails / 60.0)) * 100
@@ -587,7 +735,7 @@ class DronePlant(Plant):
         
         dvx = self.gravity * theta + wind_gust + ax_cmd
         dvy = -self.gravity * phi + ay_cmd
-        dvz = az_cmd
+        dvz = az_cmd - self.gravity
         
         dp = -10.0 * phi - 2.0 * p
         dq = -10.0 * theta - 2.0 * q
@@ -647,9 +795,12 @@ class DroneExpertController(ExpertController):
         v_target = 1.5 * error  # Proportional position gain
         acc_desired = 3.0 * (v_target - vel)  # Derivative velocity gain
         
+        # Add gravity compensation to Z-axis
+        acc_desired[2] += 9.81
+        
         # Convert acceleration back to FORCE using privileged mass knowledge
         # Expert knows the true mass, so its control is always well-calibrated
-        mass = self._plant_ref.mass if self._plant_ref is not None else 2.0
+        mass = self._plant_ref.mass if self._plant_ref is not None else 2.5
         force_cmd = acc_desired * mass
         
         # Clip to actuator limits
@@ -658,42 +809,358 @@ class DroneExpertController(ExpertController):
         return np.array([force_cmd[0], force_cmd[1], force_cmd[2], 0.0])
 
 
+# FILE: evaluate.py
+
+"""
+Evaluate a trained NNCS-Mamba checkpoint.
+
+Usage:
+    python evaluate.py --checkpoint runs/full/best_cegis.pt
+    python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot
+"""
+import argparse
+import numpy as np
+import torch
+from pathlib import Path
+
+from drone_env import DronePlant, DroneExpertController
+from mamba_learner import MambaController
+from cegis_loop import (
+    check_stl_score,
+    run_validation_rollouts,
+    plot_trajectory,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate a trained Mamba controller.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
+    parser.add_argument("--missions", type=int, default=10, help="Number of evaluation rollouts")
+    parser.add_argument("--seq-steps", type=int, default=300)
+    parser.add_argument("--dt", type=float, default=0.1)
+    parser.add_argument("--plot", action="store_true", help="Save a trajectory comparison plot")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    # Load model
+    controller = MambaController(obs_dim=12, action_dim=4, d_model=64, d_state=16, num_layers=2)
+    checkpoint = controller.load_checkpoint(args.checkpoint)
+    meta = checkpoint.get("metadata", {})
+    print(f"Loaded: {args.checkpoint}")
+    print(f"  Phase: {meta.get('phase', '?')}  Epoch/Cycle: {meta.get('epoch', '?')}")
+    print()
+
+    plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
+
+    # Run rollouts
+    metrics = run_validation_rollouts(
+        controller, plant,
+        num_missions=args.missions,
+        seq_steps=args.seq_steps,
+        dt=args.dt,
+    )
+
+    print(f"Results over {args.missions} missions:")
+    print(f"  Checkpoint ordering success: {metrics['checkpoint_order_success_rate']:.0%}")
+    print(f"  Docking success:             {metrics['docking_success_rate']:.0%}")
+    print(f"  Avg final distance to dock:  {metrics['avg_final_distance']:.2f} m")
+    print(f"  Avg checkpoints reached:     {metrics['avg_checkpoints_reached']:.1f} / 3")
+
+    # STL robustness on a single trajectory
+    plant.reset()
+    controller.reset()
+    y = plant.state.copy()
+    traj = [y]
+    for _ in range(args.seq_steps):
+        u = controller.forward(y)
+        y = plant.step(u, args.dt)
+        traj.append(y)
+    stl = check_stl_score(traj)
+    print(f"  STL robustness (1 traj):     {stl:.3f} {'✓' if stl > 0 else '✗'}")
+
+    # Optional plot
+    if args.plot:
+        init_state = plant.reset()
+        expert = DroneExpertController()
+        expert.set_plant_ref(plant)
+
+        # Mamba trajectory
+        plant.state = init_state.copy()
+        plant.time = 0.0
+        controller.reset()
+        m_traj, y = [], plant.state.copy()
+        for _ in range(args.seq_steps):
+            u = controller.forward(y)
+            y = plant.step(u, args.dt)
+            m_traj.append(y)
+
+        # Expert trajectory (same init)
+        plant.state = init_state.copy()
+        plant.time = 0.0
+        expert.reset()
+        e_traj, y = [], plant.state.copy()
+        for _ in range(args.seq_steps):
+            u = expert.compute_action(y)
+            y = plant.step(u, args.dt)
+            e_traj.append(y)
+
+        out = Path(args.checkpoint).parent / "eval_trajectory.png"
+        plot_trajectory(m_traj, e_traj, cycle="eval", filename=str(out))
+        print(f"\nPlot saved: {out}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# FILE: mamba_block.py
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+
+class MambaCache:
+    """
+    Storage for recurrent states (h) and convolution buffers (x) 
+    to enable O(1) inference.
+    """
+    def __init__(self, batch_size: int, d_model: int, d_state: int, d_conv: int, device: torch.device):
+        self.batch_size = batch_size
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.device = device
+        
+        # [Batch, Inner_Dim, D_State]
+        self.h = torch.zeros(batch_size, d_model * 2, d_state, device=device)
+        # [Batch, Inner_Dim, D_Conv]
+        self.conv_buffer = torch.zeros(batch_size, d_model * 2, d_conv, device=device)
+
+class MambaBlock(nn.Module):
+    """
+    Pure PyTorch implementation of the Mamba (S6) block.
+    Avoids all custom CUDA dependencies.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: str = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+
+        if dt_rank == "auto":
+            self.dt_rank = math.ceil(self.d_model / 16)
+        else:
+            self.dt_rank = int(dt_rank)
+
+        # Input projections
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=False)
+
+        # Conv1d
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=True,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+        )
+
+        # Activation
+        self.activation = F.silu
+
+        # S6 Projections
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # S6 Parameters
+        # A matrix: [D_Inner, D_State]
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        # Output projection
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False)
+
+        # Initialization
+        self.dt_init_floor = dt_init_floor
+        self._dt_init(dt_min, dt_max, dt_init, dt_scale)
+
+    def _dt_init(self, dt_min, dt_max, dt_init, dt_scale):
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=self.dt_init_floor)
+        
+        # Inverse softplus
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+
+    def forward(self, x: torch.Tensor, cache: Optional[MambaCache] = None):
+        """
+        x: [Batch, SeqLen, D_Model]
+        """
+        batch, seq_len, _ = x.shape
+        
+        # 1. Input Projection
+        # [B, L, 2*D_Inner]
+        xz = self.in_proj(x)
+        x, z = xz.chunk(2, dim=-1)
+
+        # 2. Convolution (handling causal padding)
+        # [B, D_Inner, L]
+        x = x.transpose(1, 2)
+        
+        if cache:
+            # Shift buffer and add new token
+            cache.conv_buffer.copy_(torch.roll(cache.conv_buffer, shifts=-1, dims=-1))
+            cache.conv_buffer[:, :, -1] = x[:, :, 0]
+            # Use buffer for convolution
+            x = F.conv1d(
+                cache.conv_buffer,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                groups=self.d_inner
+            )
+        else:
+            x = self.conv1d(x)[:, :, :seq_len]
+        
+        x = self.activation(x)
+
+        # 3. Selective Scan (S6)
+        # [B, L, D_Inner]
+        x = x.transpose(1, 2)
+        y = self.selective_scan(x, cache)
+
+        # 4. Gating & Out
+        y = y * self.activation(z)
+        return self.out_proj(y)
+
+    def selective_scan(self, x: torch.Tensor, cache: Optional[MambaCache] = None):
+        """
+        x: [B, L, D_Inner]
+        """
+        batch, seq_len, d_inner = x.shape
+        
+        # Projections
+        # [B, L, dt_rank + 2*d_state]
+        x_dbl = self.x_proj(x)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        
+        # [B, L, D_Inner]
+        dt = F.softplus(self.dt_proj(dt))
+        
+        # Discretize A and B
+        # A: [D_Inner, D_State]
+        A = -torch.exp(self.A_log)
+        
+        if cache:
+            # Sequential/Recurrent mode (Inference)
+            # h: [B, D_Inner, D_State]
+            # [B, D_Inner, D_State] * [B, D_Inner, 1] -> [B, D_Inner, D_State]
+            dA = torch.exp(dt.transpose(1, 2) * A)
+            dB = dt.transpose(1, 2) * B
+            
+            # Recurrence
+            # x: [B, 1, D_Inner] -> [B, D_Inner, 1]
+            new_h = dA * cache.h + dB * x.transpose(1, 2)
+            cache.h.copy_(new_h)
+            
+            # [B, D_Inner, D_State] @ [B, D_State, 1] -> [B, D_Inner, 1]
+            y = torch.bmm(new_h, C.transpose(1, 2)).transpose(1, 2)
+        else:
+            # Parallel mode (Training)
+            # This is a simplified version of the associative scan using pre-broadcasted dA/dB
+            # [B, L, D_Inner, D_State]
+            dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
+            dB = dt.unsqueeze(-1) * B.unsqueeze(-2)
+            
+            # Recurrent scan
+            h = torch.zeros(batch, d_inner, self.d_state, device=x.device)
+            ys = []
+            for t in range(seq_len):
+                h = dA[:, t] * h + dB[:, t] * x[:, t].unsqueeze(-1)
+                # [B, D_Inner, D_State] @ [B, D_State, 1] -> [B, D_Inner, 1]
+                y_t = torch.bmm(h, C[:, t].unsqueeze(-1))
+                ys.append(y_t)
+            
+            y = torch.stack(ys, dim=1).squeeze(-1)
+
+        # Residual connection additive part (D)
+        y = y + x * self.D
+        return y
+
+
 # FILE: mamba_learner.py
 
 import torch
 import torch.nn as nn
-from typing import Any, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
-
-from mamba_ssm import Mamba
-from mamba_ssm.utils.generation import InferenceParams
+from mamba_block import MambaBlock, MambaCache
 
 class MambaController(LearnerController, nn.Module):
     """
-    Production-ready Neural Network Controller using `mamba-ssm`.
-    Implements proper O(1) causal inference cache parameters, batched sequence learning,
-    and device scaling operations.
+    Pure PyTorch Mamba Controller.
+    No CUDA dependencies. Implements S6 Selective Scan for drone control.
     """
-    def __init__(self, obs_dim: int, action_dim: int, d_model: int = 64, d_state: int = 16, num_layers: int = 2, lr: float = 1e-4):
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        d_model: int = 64,
+        d_state: int = 16,
+        num_layers: int = 2,
+        lr: float = 1e-4,
+    ):
         nn.Module.__init__(self)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.d_model = d_model
+        self.d_state = d_state
+        self.num_layers = num_layers
         self.max_seq_len = 5000
         self.max_batch_size = 1
         self.noise_std = 0.01
         self.default_epochs = 4
+        self.default_batch_size = 32
+        self.obs_norm_eps = 1e-6
+        self.grad_clip_norm = 1.0
+        self.normalizer_fitted = False
         
+        self.register_buffer("obs_mean", torch.zeros(obs_dim, dtype=torch.float32))
+        self.register_buffer("obs_scale", torch.ones(obs_dim, dtype=torch.float32))
         self.input_norm = nn.LayerNorm(obs_dim)
         self.input_layer = nn.Linear(obs_dim, d_model)
         
         self.mamba_blocks = nn.ModuleList([
-            Mamba(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
+            MambaBlock(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
             for _ in range(num_layers)
         ])
         self.norms = nn.ModuleList([
@@ -702,8 +1169,8 @@ class MambaController(LearnerController, nn.Module):
         
         self.output_layer = nn.Linear(d_model, action_dim)
         
-        # Internal state manager for autoregressive steps
-        self.inference_params = None
+        # Internal state caches for step-by-step inference
+        self.layer_caches = []
 
         self.to(self.device)
         
@@ -717,36 +1184,93 @@ class MambaController(LearnerController, nn.Module):
         )
         self.criterion = nn.MSELoss()
         self.use_amp = self.device.type == "cuda"
-        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        if self.use_amp:
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        else:
+            self.grad_scaler = None
+
+    @property
+    def current_lr(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def get_config(self) -> Dict[str, Any]:
+        return {
+            "obs_dim": self.obs_dim,
+            "action_dim": self.action_dim,
+            "d_model": self.d_model,
+            "d_state": self.d_state,
+            "num_layers": self.num_layers,
+            "lr": self.current_lr,
+            "noise_std": self.noise_std,
+            "grad_clip_norm": self.grad_clip_norm,
+        }
         
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
-        """Resets the internal hidden memory cache for autoregressive steps across episodes."""
-        self.max_seq_len = max_seq_len
-        self.max_batch_size = max_batch_size
-        self.inference_params = InferenceParams(max_seqlen=max_seq_len, max_batch_size=max_batch_size)
-        self.inference_params.seqlen_offset = 0
+        """Resets the internal hidden memory cache for autoregressive steps."""
+        self.layer_caches = [
+            MambaCache(
+                batch_size=max_batch_size, 
+                d_model=self.d_model, 
+                d_state=self.d_state, 
+                d_conv=4, 
+                device=self.device
+            ) for _ in range(self.num_layers)
+        ]
 
     def _ensure_inference_state(self) -> None:
-        if self.inference_params is None:
-            self.reset(max_seq_len=self.max_seq_len, max_batch_size=self.max_batch_size)
-            return
-
-        if self.inference_params.seqlen_offset >= self.max_seq_len - 1:
-            self.reset(max_seq_len=self.max_seq_len, max_batch_size=self.max_batch_size)
+        if not self.layer_caches:
+            self.reset(max_batch_size=self.max_batch_size)
 
     def _encode_inputs(self, batch_obs: torch.Tensor) -> torch.Tensor:
-        return self.input_layer(self.input_norm(batch_obs))
+        normalized_obs = self._normalize_observations(batch_obs)
+        return self._encode_normalized_inputs(normalized_obs)
+
+    def _encode_normalized_inputs(self, normalized_obs: torch.Tensor) -> torch.Tensor:
+        return self.input_layer(self.input_norm(normalized_obs))
+
+    def _normalize_observations(self, batch_obs: torch.Tensor) -> torch.Tensor:
+        return (batch_obs - self.obs_mean.view(1, 1, -1)) / self.obs_scale.view(1, 1, -1)
+
+    def _move_batch_to_device(self, batch_obs: torch.Tensor, batch_act: torch.Tensor):
+        if batch_obs.device == self.device and batch_act.device == self.device:
+            return batch_obs, batch_act
+        batch_obs = batch_obs.to(self.device, non_blocking=self.device.type == "cuda")
+        batch_act = batch_act.to(self.device, non_blocking=self.device.type == "cuda")
+        return batch_obs, batch_act
+
+    def _fit_observation_normalizer(self, loader: DataLoader) -> None:
+        total_count = 0
+        feature_sum = torch.zeros(self.obs_dim, dtype=torch.float32, device=self.device)
+        feature_sq_sum = torch.zeros(self.obs_dim, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            for batch_obs, _ in loader:
+                batch_obs = batch_obs.to(self.device, non_blocking=self.device.type == "cuda")
+                flat_obs = batch_obs.reshape(-1, self.obs_dim)
+                feature_sum += flat_obs.sum(dim=0)
+                feature_sq_sum += (flat_obs * flat_obs).sum(dim=0)
+                total_count += flat_obs.shape[0]
+
+        if total_count == 0:
+            return
+
+        mean = feature_sum / total_count
+        variance = torch.clamp(feature_sq_sum / total_count - mean * mean, min=self.obs_norm_eps ** 2)
+        std = torch.sqrt(variance)
+
+        self.obs_mean.copy_(mean)
+        self.obs_scale.copy_(torch.clamp(std, min=self.obs_norm_eps))
+        self.normalizer_fitted = True
 
     def _run_cached_step(self, obs_tensor: torch.Tensor) -> torch.Tensor:
         x = self._encode_inputs(obs_tensor)
-        for block, norm in zip(self.mamba_blocks, self.norms):
-            x = x + block(norm(x), inference_params=self.inference_params)
-        self.inference_params.seqlen_offset += 1
+        for block, norm, cache in zip(self.mamba_blocks, self.norms, self.layer_caches):
+            x = x + block(norm(x), cache=cache)
         return self.output_layer(x)
         
     def forward(self, y: np.ndarray) -> np.ndarray:
         """
-        Autoregressive step in O(1) utilizing hardware-efficient cached recurrent transitions.
+        Step-by-step inference.
         """
         self.eval()
         with torch.no_grad():
@@ -756,17 +1280,32 @@ class MambaController(LearnerController, nn.Module):
 
             return np.clip(out[0, 0, :].cpu().numpy(), -20.0, 20.0)
 
-    def _build_loader_from_dataset(self, dataset, batch_size: int, shuffle: bool) -> Optional[DataLoader]:
+    def _build_loader_from_dataset(
+        self,
+        dataset,
+        batch_size: int,
+        shuffle: bool,
+        num_workers: int = 0,
+        pin_memory: Optional[bool] = None,
+    ) -> Optional[DataLoader]:
         if dataset is None or len(dataset) == 0:
             return None
 
         obs_list = [item[0] for item in dataset]
         act_list = [item[1] for item in dataset]
 
-        obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32, device=self.device)
-        act_tensor = torch.tensor(np.stack(act_list), dtype=torch.float32, device=self.device)
+        obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32)
+        act_tensor = torch.tensor(np.stack(act_list), dtype=torch.float32)
         tensor_dataset = TensorDataset(obs_tensor, act_tensor)
-        return DataLoader(tensor_dataset, batch_size=batch_size, shuffle=shuffle)
+        if pin_memory is None:
+            pin_memory = self.device.type == "cuda"
+        return DataLoader(
+            tensor_dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
     def _forward_sequence(self, batch_obs: torch.Tensor) -> torch.Tensor:
         x = self._encode_inputs(batch_obs)
@@ -784,7 +1323,10 @@ class MambaController(LearnerController, nn.Module):
 
         with torch.no_grad():
             for batch_obs, batch_act in loader:
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
+                # Safe autocast for PyTorch < 2.4/unified API
+                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode()
+                with context:
                     predictions = self._forward_sequence(batch_obs)
                     loss = self.criterion(predictions, batch_act)
                 total_loss += loss.item()
@@ -792,60 +1334,140 @@ class MambaController(LearnerController, nn.Module):
 
         return total_loss / max(1, batches_processed)
 
-    def update(self, dataset_or_loader, val_loader=None, epochs: int = 4, batch_size: int = 32):
-        """
-        Trains on either:
-        - a raw dataset of (obs_seq, act_seq) tuples, or
-        - a prebuilt training DataLoader plus optional validation DataLoader.
-
-        Returns:
-            float: train loss when called with a raw dataset
-            Tuple[float, float]: (train_loss, val_loss) when a validation loader is provided
-        """
+    def update(
+        self,
+        dataset_or_loader,
+        val_loader=None,
+        epochs: int = 4,
+        batch_size: int = 32,
+        fit_normalizer: bool = True,
+        num_workers: int = 0,
+        pin_memory: Optional[bool] = None,
+    ) -> Dict[str, float]:
         if isinstance(dataset_or_loader, DataLoader):
             train_loader = dataset_or_loader
-            return_tuple = val_loader is not None
         else:
-            train_loader = self._build_loader_from_dataset(dataset_or_loader, batch_size=batch_size, shuffle=True)
-            return_tuple = False
+            train_loader = self._build_loader_from_dataset(
+                dataset_or_loader,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+            )
 
         if train_loader is None:
-            return (0.0, float("nan")) if return_tuple else 0.0
+            return {
+                "train_loss": 0.0,
+                "val_loss": float("nan"),
+                "lr": self.current_lr,
+                "avg_grad_norm": 0.0,
+                "epochs": 0.0,
+            }
 
+        if fit_normalizer:
+            self._fit_observation_normalizer(train_loader)
         self.train()
         total_loss = 0.0
         batches_processed = 0
+        total_grad_norm = 0.0
 
         for _ in range(epochs):
             for batch_obs, batch_act in train_loader:
+                batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 self.optimizer.zero_grad(set_to_none=True)
-                noisy_obs = batch_obs + torch.randn_like(batch_obs) * self.noise_std
+                normalized_obs = self._normalize_observations(batch_obs)
+                noisy_obs = normalized_obs + torch.randn_like(normalized_obs) * self.noise_std
 
-                with torch.amp.autocast("cuda", enabled=self.use_amp):
-                    predictions = self._forward_sequence(noisy_obs)
+                # Safe autocast for PyTorch < 2.4/unified API
+                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
+                with context:
+                    predictions = self._forward_sequence_from_normalized(noisy_obs)
                     loss = self.criterion(predictions, batch_act)
 
-                self.grad_scaler.scale(loss).backward()
-                self.grad_scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-                self.grad_scaler.step(self.optimizer)
-                self.grad_scaler.update()
+                if self.grad_scaler:
+                    self.grad_scaler.scale(loss).backward()
+                    self.grad_scaler.unscale_(self.optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                else:
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
+                    self.optimizer.step()
 
                 total_loss += loss.item()
+                total_grad_norm += float(grad_norm)
                 batches_processed += 1
 
         train_loss = total_loss / max(1, batches_processed)
+        avg_grad_norm = total_grad_norm / max(1, batches_processed)
 
         validation_loss = float("nan")
-        if return_tuple:
+        if val_loader is not None:
             validation_loss = self._evaluate_loader(val_loader)
             self.scheduler.step(validation_loss if not np.isnan(validation_loss) else train_loss)
-            return train_loss, validation_loss
+        else:
+            self.scheduler.step(train_loss)
 
-        self.scheduler.step(train_loss)
+        return {
+            "train_loss": train_loss,
+            "val_loss": validation_loss,
+            "lr": self.current_lr,
+            "avg_grad_norm": avg_grad_norm,
+            "epochs": float(epochs),
+        }
 
-        return train_loss
- 
+    def _forward_sequence_from_normalized(self, normalized_obs: torch.Tensor) -> torch.Tensor:
+        x = self._encode_normalized_inputs(normalized_obs)
+        for block, norm in zip(self.mamba_blocks, self.norms):
+            x = x + block(norm(x))
+        return self.output_layer(x)
+
+    def save_checkpoint(self, path: str, **metadata: Any) -> None:
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model_state_dict": self.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "config": self.get_config(),
+            "metadata": metadata,
+            "normalizer_fitted": self.normalizer_fitted,
+        }
+        torch.save(payload, checkpoint_path)
+
+    def load_checkpoint(self, path: str, map_location: Optional[str] = None) -> Dict[str, Any]:
+        checkpoint = torch.load(path, map_location=map_location or self.device, weights_only=False)
+        self.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.normalizer_fitted = bool(checkpoint.get("normalizer_fitted", True))
+        return checkpoint
+
+    def save_checkpoint(self, path: str, **metadata: Any) -> None:
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "model_state_dict": self.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "config": self.get_config(),
+            "metadata": metadata,
+            "normalizer_fitted": self.normalizer_fitted,
+        }
+        torch.save(payload, checkpoint_path)
+
+    def load_checkpoint(self, path: str, map_location: Optional[str] = None) -> Dict[str, Any]:
+        checkpoint = torch.load(path, map_location=map_location or self.device, weights_only=False)
+        self.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.normalizer_fitted = bool(checkpoint.get("normalizer_fitted", True))
+        return checkpoint
 
 
 # FILE: simple_plant.py
@@ -920,9 +1542,9 @@ if __name__ == "__main__":
     # 2. Train Mamba Controller
     print("Training Mamba model on expert trajectories...")
     for epoch in range(20):
-        loss = mamba_ctrl.update(dataset)
+        metrics = mamba_ctrl.update(dataset)
         if epoch % 5 == 0:
-            print(f"Epoch {epoch}, Loss: {loss:.4f}")
+            print(f"Epoch {epoch}, Loss: {metrics['train_loss']:.4f}")
             
     # 3. Test Closed-Loop Runtime of Mamba
     print("Evaluating closed loop performance...")
@@ -961,8 +1583,8 @@ def test_mamba_training():
     
     # Train for a few epochs
     for epoch in range(10):
-        loss = controller.update(dataset)
-        print(f"Epoch {epoch+1}, Loss: {loss:.4f}")
+        metrics = controller.update(dataset)
+        print(f"Epoch {epoch+1}, Loss: {metrics['train_loss']:.4f}")
         
     print("Testing autoregressive forward pass...")
     controller.reset()
@@ -972,6 +1594,307 @@ def test_mamba_training():
         
 if __name__ == "__main__":
     test_mamba_training()
+
+
+# FILE: train.py
+
+"""
+Master Training Pipeline for NNCS-Mamba
+
+Usage Examples:
+1. Smoke Test (Fast check):
+   python train.py --phase smoke --outdir runs/smoke
+
+2. Baseline Imitation (The heavy lifting):
+   python train.py --phase imitation --num-traj 5000 --batch-size 32 --outdir runs/imitation
+
+3. CEGIS Refinement (Hunting edge cases):
+   python train.py --phase cegis --resume runs/imitation/best_imitation.pt --cegis-cycles 20
+
+4. Full Pipeline (Imitation → CEGIS, one command):
+   python train.py --phase all --outdir runs/full
+"""
+
+import argparse
+import json
+import numpy as np
+import torch
+from pathlib import Path
+from collections import deque
+from torch.utils.data import DataLoader, TensorDataset
+
+from drone_env import DronePlant, DroneExpertController
+from mamba_learner import MambaController
+from cegis_loop import falsify_cem, fix_and_merge
+
+
+# =============================================================================
+# Helper: CPU-Backed Dataloader (Prevents T4 OOM Errors)
+# =============================================================================
+def create_cpu_dataloaders(dataset, batch_size, val_split=0.15):
+    """Converts the list of trajectories into CPU-bound PyTorch DataLoaders."""
+    data_list = list(dataset)
+    np.random.shuffle(data_list)
+
+    split_idx = int(len(data_list) * (1 - val_split))
+    train_raw = data_list[:split_idx]
+    val_raw = data_list[split_idx:]
+
+    def to_dataset(raw_list):
+        if not raw_list:
+            return None
+        # KEEP ON CPU: Do not use device='cuda' here!
+        # The MambaController will move batches to GPU during training.
+        o = torch.tensor(np.stack([x[0] for x in raw_list]), dtype=torch.float32)
+        a = torch.tensor(np.stack([x[1] for x in raw_list]), dtype=torch.float32)
+        return TensorDataset(o, a)
+
+    train_ds = to_dataset(train_raw)
+    val_ds = to_dataset(val_raw)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True) if val_ds else None
+
+    return train_loader, val_loader
+
+
+# =============================================================================
+# Helper: Generate Baseline Data
+# =============================================================================
+def generate_expert_data(num_traj, seq_steps, dt):
+    print(f"[*] Harvesting {num_traj} expert trajectories...")
+    plant = DronePlant()
+    expert = DroneExpertController()
+    dataset = []
+
+    for i in range(num_traj):
+        y = plant.reset()
+        # Randomize start-time to simulate partially burned fuel (Low-Mass training)
+        if np.random.rand() > 0.5:
+            plant.time = np.random.uniform(0.0, 60.0) 
+            y = plant.state.copy()
+            
+        expert.reset()
+        expert.set_plant_ref(plant)
+
+        o_seq, a_seq = [], []
+        for _ in range(seq_steps):
+            u = expert.compute_action(y)
+            o_seq.append(y)
+            a_seq.append(u)
+            y = plant.step(u, dt)
+
+        dataset.append((np.array(o_seq, dtype=np.float32), np.array(a_seq, dtype=np.float32)))
+        if (i + 1) % 500 == 0:
+            print(f"    ...generated {i + 1}/{num_traj}")
+
+    return dataset
+
+
+# =============================================================================
+# Phase Runners
+# =============================================================================
+def run_smoke(controller, args, outdir):
+    """Quick sanity check — kernels compile, backward pass works."""
+    print("\n=== PHASE: SMOKE TEST ===")
+    print("Testing kernel compilation and backward pass...")
+    dataset = generate_expert_data(10, 100, 0.1)
+    train_loader, val_loader = create_cpu_dataloaders(dataset, batch_size=2)
+    metrics = controller.update(train_loader, val_loader, epochs=2, fit_normalizer=True)
+    print(f"Smoke Test Complete. Train Loss: {metrics['train_loss']:.4f} | Val Loss: {metrics['val_loss']:.4f}")
+
+
+def run_imitation(controller, args, outdir, dataset):
+    """Pure imitation learning from expert demonstrations."""
+    print("\n=== PHASE: BASELINE IMITATION ===")
+    train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
+
+    best_val_loss = float("inf")
+    csv_log = open(outdir / "imitation_log.csv", "w")
+    csv_log.write("epoch,train_loss,val_loss,lr\n")
+
+    for epoch in range(1, args.epochs + 1):
+        metrics = controller.update(
+            train_loader, val_loader,
+            epochs=1,
+            fit_normalizer=(epoch == 1 and not controller.normalizer_fitted),
+        )
+        t_loss = metrics["train_loss"]
+        v_loss = metrics["val_loss"]
+        lr = metrics["lr"]
+
+        csv_log.write(f"{epoch},{t_loss:.6f},{v_loss:.6f},{lr:.2e}\n")
+        csv_log.flush()
+
+        print(f"Epoch {epoch:03d}/{args.epochs} | Train MSE: {t_loss:.5f} | Val MSE: {v_loss:.5f} | LR: {lr:.2e}")
+
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            controller.save_checkpoint(str(outdir / "best_imitation.pt"), phase="imitation", epoch=epoch)
+            print("   -> Saved new best checkpoint.")
+
+    csv_log.close()
+    controller.save_checkpoint(str(outdir / "last_imitation.pt"), phase="imitation", epoch=args.epochs)
+    print("\n[*] Imitation Phase Complete.")
+    return outdir / "best_imitation.pt"
+
+
+def run_cegis(controller, args, outdir, dataset):
+    """CEGIS refinement — falsify, fix, retrain."""
+    print("\n=== PHASE: CEGIS REFINEMENT ===")
+
+    plant = DronePlant()
+    expert = DroneExpertController()
+    expert.set_plant_ref(plant)
+
+    csv_log = open(outdir / "cegis_log.csv", "w")
+    csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
+
+    for cycle in range(1, args.cegis_cycles + 1):
+        print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
+
+        # 1. Hunt for failures
+        print("[*] Falsifier hunting for edge cases...")
+        failures = falsify_cem(
+            controller, plant, expert,
+            pop_size=60, seq_steps=args.seq_steps, dt=0.1,
+        )
+
+        num_fails = len(failures)
+        coverage = (1.0 - min(1.0, num_fails / 60.0)) * 100
+        print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.1f}%")
+
+        if num_fails == 0:
+            print("\n✔️  CEGIS Converged! 100% Safety Coverage achieved.")
+            controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
+            break
+
+        # 2. Expert Intervention
+        print("[*] Generating expert corrections...")
+        fix_and_merge(failures, expert, plant, dataset, args.seq_steps, 0.1)
+
+        # 3. Retrain
+        print(f"[*] Retraining on updated dataset (Size: {len(dataset)})...")
+        train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
+        metrics = controller.update(
+            train_loader, val_loader,
+            epochs=5,
+            fit_normalizer=(cycle == 1 and not controller.normalizer_fitted),
+        )
+        t_loss = metrics["train_loss"]
+        v_loss = metrics["val_loss"]
+
+        csv_log.write(f"{cycle},{num_fails},{coverage:.1f},{t_loss:.6f},{v_loss:.6f}\n")
+        csv_log.flush()
+
+        # Save progress
+        controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), phase="cegis", cycle=cycle)
+
+    csv_log.close()
+    controller.save_checkpoint(str(outdir / "last_cegis.pt"), phase="cegis", cycle=args.cegis_cycles)
+    print("\n[*] CEGIS Pipeline Finished.")
+    return outdir / "best_cegis.pt"
+
+
+# =============================================================================
+# Main
+# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="NNCS-Mamba Robust Trainer")
+    parser.add_argument("--phase", choices=["smoke", "imitation", "cegis", "all"], required=True)
+    parser.add_argument("--outdir", type=str, default="runs/experiment")
+    parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
+
+    # Hyperparameters
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=32)
+
+    # Data & Training
+    parser.add_argument("--num-traj", type=int, default=5000)
+    parser.add_argument("--seq-steps", type=int, default=300)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--cegis-cycles", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    # Setup
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Save config
+    with open(outdir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=4)
+
+    # Initialize Controller
+    print("[*] Initializing Mamba Controller...")
+    controller = MambaController(
+        obs_dim=12, action_dim=4,
+        d_model=args.d_model, d_state=args.d_state,
+        num_layers=args.layers, lr=args.lr,
+    )
+    print(f"    Device: {controller.device}")
+
+    if args.resume:
+        print(f"[*] Resuming from checkpoint: {args.resume}")
+        controller.load_checkpoint(args.resume)
+
+    # ── Smoke ──
+    if args.phase == "smoke":
+        run_smoke(controller, args, outdir)
+        return
+
+    # ── Dataset Management ──
+    # Cache the baseline dataset to avoid re-harvesting (saves 5-10 mins on restart)
+    cache_path = Path("baseline_dataset.pt")
+    dataset = deque(maxlen=args.num_traj + 1000)
+    
+    if cache_path.exists() and args.num_traj > 0:
+        print(f"[*] Loading cached baseline dataset from {cache_path}...")
+        try:
+            cached_data = torch.load(cache_path, weights_only=True)
+            # If the user requested a different number of trajectories, adjust
+            if len(cached_data) > args.num_traj:
+                cached_data = cached_data[:args.num_traj]
+            dataset.extend(cached_data)
+            print(f"    Loaded {len(dataset)} trajectories.")
+        except Exception as e:
+            print(f"    [!] Failed to load cache: {e}. Re-harvesting...")
+            raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+            dataset.extend(raw_data)
+            torch.save(list(dataset), cache_path)
+    elif args.num_traj > 0:
+        raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+        dataset.extend(raw_data)
+        torch.save(list(dataset), cache_path)
+        print(f"[*] Baseline dataset cached to {cache_path}")
+
+    # ── Imitation ──
+    if args.phase == "imitation":
+        run_imitation(controller, args, outdir, dataset)
+        return
+
+    # ── CEGIS ──
+    if args.phase == "cegis":
+        # If resuming for CEGIS, we might not need to harvest if we just want to hunt
+        run_cegis(controller, args, outdir, dataset)
+        return
+
+    # ── All: Imitation → CEGIS ──
+    run_imitation(controller, args, outdir, dataset)
+    run_cegis(controller, args, outdir, dataset)
+
+
+if __name__ == "__main__":
+    main()
 
 
 # FILE: train_drone.py
@@ -1012,10 +1935,10 @@ def evaluate_drone():
     print(f"Collected {len(dataset)} trajectories. Sequence length: {seq_steps} steps.")
     print("Training Mamba sequence model...")
     # Train Mamba natively across sequence representations
-    for epoch in range(1, 21):
-        loss = mamba_ctrl.update(dataset)
+    for epoch in range(1, 51):
+        metrics = mamba_ctrl.update(dataset)
         if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:02d} | Sequence MSE Loss: {loss:.4f}")
+            print(f"Epoch {epoch:02d} | Sequence MSE Loss: {metrics['train_loss']:.4f}")
             
     print("\n--- ZERO-SHOT CLOSED-LOOP EVALUATION ---")
     print("Mamba evaluates online tracking with hidden state persistence.")
@@ -1042,6 +1965,13 @@ if __name__ == "__main__":
     np.random.seed(42)
     torch.manual_seed(42)
     evaluate_drone()
+
+
+# FILE: requirements.txt
+
+numpy
+torch>=2.4.0
+matplotlib
 
 
 # FILE: README.md
@@ -1072,16 +2002,94 @@ This repository implements a framework to synthesize Neural Network Control Syst
 3. **Transition to Target Software Simulation**: Currently, the `DronePlant` utilizes an internalized affine set of derivatives. Once verified, refactor `DronePlant.step()` to connect directly with your formal Quadrotor aerodynamic simulator or API (e.g. IsaacGym, PyBullet).
 
 
-# FILE: requirements.txt
+# FILE: .gitignore
 
-numpy
-torch>=2.0.0
-mamba-ssm
-causal-conv1d
-matplotlib
+*.pdf
+*.pyc
+nncs_mamba_colab_train.ipynb
 
 
 # FILE: notes_for_me.md
 
 The Proposed Goal: "Aggressive 3D Docking under Wind"1. The Target (The "What")Primary Goal: Move the plant (drone) from any random 3D starting position $x, y, z$ to a specific "Docking Zone" (the origin $(0,0,0)$).Secondary Goal: Maintain the drone within a very tight stabilization region $s_{st}$ around the origin indefinitely, even when "pushed" by external forces.2. The Environment Complexity (The "Toughness")3D Dynamics: Increase the state vector from 6 variables to 12 (Position $x,y,z$, Orientation $\phi, \theta, \psi$, and their velocities).Selective Memory Requirement: Introduce a periodic wind gust (e.g., a gust that occurs every 5 seconds).Why this fits Mamba: To satisfy the stability requirement, Mamba must learn to "attend" to the pattern of the wind. A standard MLP with a small sliding window will "forget" the wind pattern, while Mamba can store it in its hidden state.3. The Formal Specifications (The "Rules")You would use the same logic as Equations (2-4) in the paper but applied to a 3D vector:Rule 1 (Overshoot): The drone must never exceed a distance $s_{ov}$ from the path to the origin. This ensures it doesn't swing wildly.Rule 2 (Transient Time): The drone must reach the Docking Zone within $\tau_{tr}$ seconds.Rule 3 (Sequential Logic): The drone must visit a "Pre-Docking Point" before entering the final Docking Zone.Why this fits Mamba: This creates a "Temporal Logic" dependency. The model has to remember: "I have already visited the pre-docking point, so now it is safe to dock."By adding that Sequential Logic (Step A then Step B), you make it impossible for a memoryless controller to succeed. Mamba’s recurrent architecture will have to maintain the "knowledge" of its progress in its state-space to satisfy the specification.
 
+
+# FILE: nncs_mamba_colab_train.ipynb
+
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "# NNCS-Mamba (Pure PyTorch S6)\n",
+        "Select **T4 GPU** runtime, run all cells.\n",
+        "\n",
+        "**Note:** Dataset is automatically cached to `baseline_dataset.pt` after the first harvest to make restarts instant."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "# ── 1. Setup ──\n",
+        "!rm -rf /content/NNCS-Mamba\n",
+        "!git clone https://github.com/varun29-git/NNCS-Mamba.git /content/NNCS-Mamba\n",
+        "%cd /content/NNCS-Mamba\n",
+        "!pip install -q -r requirements.txt"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "# ── 2a. Full Training (Phase 1 + 2) ──\n",
+        "!python train.py --phase all --outdir runs/full"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "# ── 2b. Phase 2 Only (Resume CEGIS) ──\n",
+        "# Use this if Phase 1 is already finished and you want to jump straight to refinement.\n",
+        "!python train.py --phase cegis --resume runs/full/best_imitation.pt --outdir runs/full"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "# ── 3. Evaluate ──\n",
+        "!python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot"
+      ]
+    }
+  ],
+  "metadata": {
+    "accelerator": "GPU",
+    "colab": {
+      "gpuType": "T4",
+      "name": "nncs_mamba_colab_train.ipynb",
+      "provenance": []
+    },
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.10"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}

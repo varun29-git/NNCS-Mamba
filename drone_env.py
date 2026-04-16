@@ -80,7 +80,7 @@ class DronePlant(Plant):
         
         dvx = self.gravity * theta + wind_gust + ax_cmd
         dvy = -self.gravity * phi + ay_cmd
-        dvz = az_cmd
+        dvz = az_cmd - self.gravity
         
         dp = -10.0 * phi - 2.0 * p
         dq = -10.0 * theta - 2.0 * q
@@ -140,9 +140,12 @@ class DroneExpertController(ExpertController):
         v_target = 1.5 * error  # Proportional position gain
         acc_desired = 3.0 * (v_target - vel)  # Derivative velocity gain
         
+        # Add gravity compensation to Z-axis
+        acc_desired[2] += 9.81
+        
         # Convert acceleration back to FORCE using privileged mass knowledge
         # Expert knows the true mass, so its control is always well-calibrated
-        mass = self._plant_ref.mass if self._plant_ref is not None else 2.0
+        mass = self._plant_ref.mass if self._plant_ref is not None else 2.5
         force_cmd = acc_desired * mass
         
         # Clip to actuator limits

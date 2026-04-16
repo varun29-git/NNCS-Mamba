@@ -1,0 +1,15 @@
+{
+    "phase": "imitation",
+    "outdir": "runs/experiment",
+    "resume": null,
+    "d_model": 128,
+    "d_state": 16,
+    "layers": 3,
+    "lr": 0.0003,
+    "batch_size": 32,
+    "num_traj": 20,
+    "seq_steps": 300,
+    "epochs": 5,
+    "cegis_cycles": 20,
+    "seed": 42
+}

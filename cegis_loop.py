@@ -165,7 +165,7 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     print(f"-> Trajectory plot saved: {filename}")
 
 
-def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=2, pop_size=30, 
+def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=60, 
                 elite_frac=0.2, seq_steps=300, dt=0.1):
     """
     CEM Falsifier adapted for the multi-checkpoint environment.
@@ -427,7 +427,7 @@ def build_cegis_framework():
     DT = 0.1
     MAX_ITER = 10
     
-    mamba_ctrl = MambaController(obs_dim=D_OBS, action_dim=D_ACT, d_model=64, d_state=16, num_layers=2, lr=3e-4)
+    mamba_ctrl = MambaController(obs_dim=D_OBS, action_dim=D_ACT, d_model=128, d_state=16, num_layers=3, lr=3e-4)
     drone_plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
     expert_ctrl = DroneExpertController()
     expert_ctrl.set_plant_ref(drone_plant)
