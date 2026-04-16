@@ -312,6 +312,13 @@ def main():
         print(f"[*] Loading cached baseline dataset from {cache_path}...")
         try:
             cached_data = torch.load(cache_path, weights_only=False)
+            
+            # DIMENSION CHECK: If cache is old 12D, invalidate it
+            sample_obs = cached_data[0][0] # First traj, first step
+            if sample_obs.shape[-1] != 15:
+                print(f"[!] Cache dimension mismatch ({sample_obs.shape[-1]}D != 15D). Invalidating cache...")
+                raise ValueError("Old cache format")
+                
             # If the user requested a different number of trajectories, adjust
             if len(cached_data) > args.num_traj:
                 cached_data = cached_data[:args.num_traj]
