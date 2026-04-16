@@ -249,12 +249,12 @@ def main():
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
-    # Hyperparameters (Optimized for 20GB A100 VRAM)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--d-state", type=int, default=32)
-    parser.add_argument("--layers", type=int, default=6)
+    # Hyperparameters (Conservative — guaranteed fit on A100 MIG 3g.20gb)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=64)
 
     # Data & Training
     parser.add_argument("--num-traj", type=int, default=15000)
