@@ -1,6 +1,6 @@
 # ============================================================
 # COMPLETE REPOSITORY CODE — NNCS-Mamba
-# Generated: Thu Apr 16 10:00:59 IST 2026
+# Generated: Fri Apr 17 10:34:18 IST 2026
 # ============================================================
 
 # ============================================================
@@ -569,6 +569,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
 from mamba_block import MambaBlock, MambaCache
+from muon_optimizer import Muon
 
 class MambaController(LearnerController, nn.Module):
     """
@@ -622,10 +623,21 @@ class MambaController(LearnerController, nn.Module):
 
         self.to(self.device)
         
-        # Persistent optimizer & loss function
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        # Muon + AdamW Brain Split Optimizer Setup
+        muon_params = []
+        adam_params = []
+        for name, param in self.named_parameters():
+            if param.ndim == 2:
+                muon_params.append(param)
+            else:
+                adam_params.append(param)
+        
+        # Consistent with standard Muon usage: Higher LR for Muon, baseline for AdamW
+        self.optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
+        self.optimizer_adamw = torch.optim.AdamW(adam_params, lr=lr, weight_decay=0.01)
+        
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
+            self.optimizer_adamw,
             mode="min",
             factor=0.5,
             patience=3,
@@ -639,7 +651,7 @@ class MambaController(LearnerController, nn.Module):
 
     @property
     def current_lr(self) -> float:
-        return float(self.optimizer.param_groups[0]["lr"])
+        return float(self.optimizer_adamw.param_groups[0]["lr"])
 
     def get_config(self) -> Dict[str, Any]:
         return {
@@ -832,7 +844,8 @@ class MambaController(LearnerController, nn.Module):
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 batch_next = batch_next.to(self.device, non_blocking=True)
                 
-                self.optimizer.zero_grad(set_to_none=True)
+                self.optimizer_muon.zero_grad(set_to_none=True)
+                self.optimizer_adamw.zero_grad(set_to_none=True)
                 
                 normalized_obs = self._normalize_observations(batch_obs)
                 noisy_obs = normalized_obs.clone()
@@ -847,14 +860,17 @@ class MambaController(LearnerController, nn.Module):
 
                 if self.grad_scaler:
                     self.grad_scaler.scale(loss).backward()
-                    self.grad_scaler.unscale_(self.optimizer)
+                    self.grad_scaler.unscale_(self.optimizer_muon)
+                    self.grad_scaler.unscale_(self.optimizer_adamw)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.step(self.optimizer_muon)
+                    self.grad_scaler.step(self.optimizer_adamw)
                     self.grad_scaler.update()
                 else:
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.optimizer.step()
+                    self.optimizer_muon.step()
+                    self.optimizer_adamw.step()
 
                 total_loss += loss.item()
                 total_grad_norm += float(grad_norm)
@@ -885,7 +901,8 @@ class MambaController(LearnerController, nn.Module):
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "model_state_dict": self.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
+            "optimizer_muon_state_dict": self.optimizer_muon.state_dict(),
+            "optimizer_adamw_state_dict": self.optimizer_adamw.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": self.get_config(),
             "metadata": metadata,
@@ -896,13 +913,91 @@ class MambaController(LearnerController, nn.Module):
     def load_checkpoint(self, path: str, map_location: Optional[str] = None) -> Dict[str, Any]:
         checkpoint = torch.load(path, map_location=map_location or self.device, weights_only=False)
         self.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        # New split optimizer loading
+        if "optimizer_muon_state_dict" in checkpoint:
+            self.optimizer_muon.load_state_dict(checkpoint["optimizer_muon_state_dict"])
+        if "optimizer_adamw_state_dict" in checkpoint:
+            self.optimizer_adamw.load_state_dict(checkpoint["optimizer_adamw_state_dict"])
+            
+        # Legacy compatibility
+        if "optimizer_state_dict" in checkpoint and "optimizer_adamw_state_dict" not in checkpoint:
+            self.optimizer_adamw.load_state_dict(checkpoint["optimizer_state_dict"])
+            
         if "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.normalizer_fitted = bool(checkpoint.get("normalizer_fitted", True))
         return checkpoint
  
+
+
+# ============================================================
+# FILE: muon_optimizer.py
+# ============================================================
+
+import torch
+
+def zeropower_via_newtonschulz5(G, steps: int):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. 
+    Balanced for GPU efficiency and convergence.
+    """
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.to(torch.float32) # Ensure precision for orthogonalization
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A 
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X.to(G.dtype)
+
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    return update
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+    Optimized for hidden 2D weights in neural networks.
+    """
+    def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                
+                update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+        return loss
 
 
 # ============================================================
@@ -1076,7 +1171,7 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     print(f"-> Trajectory plot saved: {filename}")
 
 
-def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=10000, 
+def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=2000, 
                 elite_frac=0.2, seq_steps=300, dt=0.1):
     """
     Massively Scaled CEM Falsifier adapted for the multi-checkpoint environment.
@@ -1627,8 +1722,8 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
     csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
-        if time.time() - global_start_time > 9.5 * 3600:
-            print("[!] Time limit reached (9.5 hours). Gracefully exiting Imitation Phase...")
+        if time.time() - global_start_time > 14.0 * 3600:
+            print("[!] Time limit reached (14 hours). Gracefully exiting Imitation Phase...")
             break
             
         metrics = controller.update(
@@ -1670,8 +1765,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
 
     for cycle in range(1, args.cegis_cycles + 1):
-        if time.time() - global_start_time > 9.5 * 3600:
-            print("[!] Time limit reached (9.5 hours). Gracefully exiting CEGIS Phase...")
+        if time.time() - global_start_time > 14.0 * 3600:
+            print("[!] Time limit reached (14 hours). Gracefully exiting CEGIS Phase...")
             break
         
         print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
@@ -1679,8 +1774,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         # 1. Hunt for failures
         print("[*] Falsifier hunting for edge cases...")
         failures = falsify_cem(
-            controller, plant, expert,
-            pop_size=10000, seq_steps=args.seq_steps, dt=0.1,
+            controller, plant, expert, num_generations=3, pop_size=2000, 
+            elite_frac=0.2, seq_steps=args.seq_steps, dt=0.1,
         )
 
         num_fails = len(failures)
@@ -1736,18 +1831,18 @@ def main():
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
-    # Hyperparameters (Optimized for 20GB A100 VRAM)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--d-state", type=int, default=32)
-    parser.add_argument("--layers", type=int, default=6)
+    # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--d-state", type=int, default=16)
+    parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=32)
 
     # Data & Training
-    parser.add_argument("--num-traj", type=int, default=15000)
+    parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--cegis-cycles", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--cegis-cycles", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -1777,16 +1872,9 @@ def main():
     )
     print(f"    Device: {controller.device}")
 
-    # A100 Kernel Fusion (requires PyTorch >= 2.0 and CUDA)
-    if torch.cuda.is_available():
-        try:
-            controller._forward_sequence_from_normalized = torch.compile(
-                controller._forward_sequence_from_normalized, 
-                mode="reduce-overhead"
-            )
-            print("[*] Enabled Kernel Fusion (torch.compile) for forward sequence.")
-        except Exception as e:
-            print(f"[!] torch.compile failed: {e}")
+    # NOTE: torch.compile disabled — CUDA Graphs consume ~1.2GB extra VRAM
+    # which causes OOM on A100 MIG 3g.20gb (19.5GB) slices. The sequential
+    # for-loop in selective_scan causes graph breaks anyway, negating benefits.
 
     if args.resume:
         print(f"[*] Resuming from checkpoint: {args.resume}")
@@ -1805,7 +1893,14 @@ def main():
     if cache_path.exists() and args.num_traj > 0:
         print(f"[*] Loading cached baseline dataset from {cache_path}...")
         try:
-            cached_data = torch.load(cache_path, weights_only=True)
+            cached_data = torch.load(cache_path, weights_only=False)
+            
+            # DIMENSION CHECK: If cache is old 12D, invalidate it
+            sample_obs = cached_data[0][0] # First traj, first step
+            if sample_obs.shape[-1] != 15:
+                print(f"[!] Cache dimension mismatch ({sample_obs.shape[-1]}D != 15D). Invalidating cache...")
+                raise ValueError("Old cache format")
+                
             # If the user requested a different number of trajectories, adjust
             if len(cached_data) > args.num_traj:
                 cached_data = cached_data[:args.num_traj]
@@ -1881,7 +1976,7 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load model (must match training architecture: 15D input, 512-dim, 6 layers)
-    controller = MambaController(obs_dim=15, action_dim=4, d_model=512, d_state=32, num_layers=6)
+    controller = MambaController(obs_dim=15, action_dim=4, d_model=128, d_state=16, num_layers=3)
     checkpoint = controller.load_checkpoint(args.checkpoint)
     meta = checkpoint.get("metadata", {})
     print(f"Loaded: {args.checkpoint}")

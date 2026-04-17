@@ -33,7 +33,7 @@ def main():
     torch.manual_seed(args.seed)
 
     # Load model (must match training architecture: 15D input, 512-dim, 6 layers)
-    controller = MambaController(obs_dim=15, action_dim=4, d_model=384, d_state=16, num_layers=6)
+    controller = MambaController(obs_dim=15, action_dim=4, d_model=128, d_state=16, num_layers=3)
     checkpoint = controller.load_checkpoint(args.checkpoint)
     meta = checkpoint.get("metadata", {})
     print(f"Loaded: {args.checkpoint}")

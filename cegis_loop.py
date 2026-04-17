@@ -165,7 +165,7 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     print(f"-> Trajectory plot saved: {filename}")
 
 
-def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=10000, 
+def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=2000, 
                 elite_frac=0.2, seq_steps=300, dt=0.1):
     """
     Massively Scaled CEM Falsifier adapted for the multi-checkpoint environment.

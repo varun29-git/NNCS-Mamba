@@ -192,8 +192,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         # 1. Hunt for failures
         print("[*] Falsifier hunting for edge cases...")
         failures = falsify_cem(
-            controller, plant, expert,
-            pop_size=10000, seq_steps=args.seq_steps, dt=0.1,
+            controller, plant, expert, num_generations=3, pop_size=2000, 
+            elite_frac=0.2, seq_steps=args.seq_steps, dt=0.1,
         )
 
         num_fails = len(failures)
@@ -249,18 +249,18 @@ def main():
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
-    # Hyperparameters ('Sweet Spot' — Safe & Expressive for 20GB A100 MIG)
-    parser.add_argument("--d-model", type=int, default=384)
+    # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
+    parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--d-state", type=int, default=16)
-    parser.add_argument("--layers", type=int, default=6)
+    parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
 
     # Data & Training
-    parser.add_argument("--num-traj", type=int, default=15000)
+    parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--cegis-cycles", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--cegis-cycles", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
