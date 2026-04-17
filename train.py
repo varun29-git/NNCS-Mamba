@@ -117,6 +117,28 @@ def generate_expert_data(num_traj, seq_steps, dt):
     return dataset
 
 
+def fix_and_merge(failures, expert, plant, buffer, seq_steps, dt):
+    """Takes failure states, has the expert fix them, and adds to buffer."""
+    for state in failures:
+        plant.state = state.copy()
+        plant.time = 0.0
+        expert.reset()
+        expert.set_plant_ref(plant)
+        
+        o_seq, a_seq = [], []
+        y = state.copy()
+        for _ in range(seq_steps):
+            u = expert.compute_action(y)
+            # 15D concatenation for consistency
+            target = CHECKPOINTS[expert.phase_idx]
+            o_seq.append(np.concatenate([y, target]))
+            a_seq.append(u)
+            y = plant.step(u, dt)
+            
+        buffer.append((np.array(o_seq, dtype=np.float32), np.array(a_seq, dtype=np.float32)))
+
+
+
 # =============================================================================
 # Phase Runners
 # =============================================================================
@@ -140,8 +162,8 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
     csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
-        if time.time() - global_start_time > 14.0 * 3600:
-            print("[!] Time limit reached (14 hours). Gracefully exiting Imitation Phase...")
+        if time.time() - global_start_time > 2.5 * 3600:
+            print("[!] Time limit reached (2.5 hours). Gracefully exiting Imitation Phase...")
             break
             
         metrics = controller.update(
@@ -183,8 +205,8 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
 
     for cycle in range(1, args.cegis_cycles + 1):
-        if time.time() - global_start_time > 14.0 * 3600:
-            print("[!] Time limit reached (14 hours). Gracefully exiting CEGIS Phase...")
+        if time.time() - global_start_time > 2.5 * 3600:
+            print("[!] Time limit reached (2.5 hours). Gracefully exiting CEGIS Phase...")
             break
         
         print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
@@ -197,7 +219,7 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         )
 
         num_fails = len(failures)
-        coverage = (1.0 - min(1.0, num_fails / 10000.0)) * 100
+        coverage = (1.0 - min(1.0, num_fails / 2000.0)) * 100
         print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.2f}%")
 
         if num_fails == 0:
