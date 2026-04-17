@@ -1,4 +1,36 @@
+# Neural Controller Training Outputs
+runs/
+*.pt
+*.csv
+*.png
+*.log
+
+# Personal & Concatenated Files
+COMPLETE_REPO_CODE.txt
+notes_for_me.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+.ipynb_checkpoints/
+*.ipynb
+
+# LaTeX
+*.aux
+*.fdb_latexmk
+*.fls
+*.gz
 *.pdf
-*.pyc
-nncs_mamba_colab_train.ipynb
+*.toc
+*.out
+# Keep Progress_Report.tex source, but ignore it as requested
 Progress_Report.tex
+
+# System
+.DS_Store
+Thumbs.db
