@@ -1,24 +1,66 @@
-# NNCS-Mamba: Counter-Example Guided Imitation Learning
+# NNCS-Mamba (under development)
 
-This repository implements a framework to synthesize Neural Network Control Systems (NNCS) utilizing recurrent state-space models (**Mamba / SSMs**) rather than standard stateless Multi-Layer Perceptrons (MLPs). It focuses on guaranteeing Parametric Signal Temporal Logic (PSTL) specifications for dynamic unobserved states in control environments.
+This repository implements a framework for training a neural‑network controller for a 12‑dimensional drone using Counter‑Example Guided Inductive Synthesis (CEGIS). The code is still being written and is not yet complete.
 
-## Current Capabilities
+## Overview
+- A simulated drone with a 12‑D state (position, velocity, tilt, angular rates).
+- The mission consists of three steps: reach checkpoint A, then checkpoint B, then dock at the origin.
+- Hidden disturbances: a leaky fuel tank (mass decreases) and invisible wind gusts.
 
-- **12D Drone Plant Simulation (`drone_env.py`)**: A continuous drone simulation evaluating aggressive 3D docking maneuvers, incorporating hidden mathematical dynamics (unobservable periodic wind gusts) designed to force recurrent memory usage.
-- **Sequential Expert Controller (`drone_env.py`)**: A robust algorithmic demonstrator that perfectly executes sequential logic pathways (visiting a Pre-Dock coordinate before descending to the absolute Origin), generating flawless reference trajectories.
-- **Mamba SSM Learner (`mamba_learner.py`)**: A neural learner/student policy integrating `mamba-ssm`. It learns from expert controller demonstrations, trains with native parallel scan scaling over trajectory sequences, and shifts to constant $O(1)$ recurrent sequence processing using `InferenceParams` during online rollout. 
-- **Automated CEGIS Loop (`cegis_loop.py`)**: A discrete programmatic iteration script that pits a Temporal Logic Falsifier against the neural model, structurally isolating edge-cases to iteratively synthesize a perfectly stable control policy.
+## Simulation Environment (`drone_env.py`)
+- Provides the physics of the drone, including fuel loss and wind.
+- Defines three checkpoints and a radius (`CHECKPOINT_RADIUS = 1.5`) for successful visits.
+- Keeps a phase counter that tells the controller which checkpoint is next.
 
-## The Operational Workflow 
+## Expert (Teacher) Controller (`drone_env.py`)
+- A physics‑based controller that knows the exact mass and wind.
+- Generates perfect trajectories that the neural controller can imitate.
+- Used to create corrective examples during the CEGIS refinement phase.
 
-1. **Initialization**: The CEGIS framework starts the Mamba model with an extremely small baseline imitation dataset (~5 trajectories).
-2. **Parallel Train**: The model minimizes MSE error natively across the sequential data lengths using its hardware-accelerated mapping layer.
-3. **Falsify**: A test matrix simulates the neural model acting live on `30` severe zero-shot edge conditions. A formal routine verifies bounded logic parameters (e.g., maximum target overshoot $s_{ov} < 15.0$ and ultimate target stabilization $s_{st} < 2.0$). 
-4. **Fix & Merge**: If an initial state condition breaks the neural controller's logic loop, it triggers the Expert Controller to simulate perfectly from that exact coordinate, splicing the correct algorithmic response back into Mamba's dataset.
-5. **Convergence**: This iterative interaction continues recursively until the *Performance Similarity index* confirms zero failures, meaning the SSM policy formally bounds to the logic specifications.
+## Neural Architecture (Mamba) (`mamba_learner.py`)
+- Uses a Mamba block (a selective state‑space model) that maintains a hidden state across time steps.
+- The hidden state works like a small notebook, remembering which checkpoints have been visited.
+- Takes a 15‑D observation (12‑D state + 3‑D target waypoint) and outputs thrust commands.
 
-## What You Need to Do Next
+## Optimizer
+- Split optimizer: **Muon** for the linear weight matrices and **AdamW** for all other parameters.
+- Mixed‑precision training with PyTorch AMP.
+- Learning‑rate scheduler reduces the rate when validation loss stops improving.
 
-1. **GPU Environment Transfer**: Push this codebase to a CUDA-enabled machine/cluster. Set up the environment running `pip install -r requirements.txt`. (Strictly requires GPU configuration to correctly build both `mamba-ssm` and `causal-conv1d`).
-2. **Run Execution**: Initiate the core `python cegis_loop.py` script. Watch the terminal iteratively increase its performance similarity parameter until it caps at 100%. 
-3. **Transition to Target Software Simulation**: Currently, the `DronePlant` utilizes an internalized affine set of derivatives. Once verified, refactor `DronePlant.step()` to connect directly with your formal Quadrotor aerodynamic simulator or API (e.g. IsaacGym, PyBullet).
+## Training Pipeline (`train.py`)
+1. **Smoke test** – quick run to verify the model compiles.
+2. **Imitation learning** – train on expert trajectories (default 5,000) for a configurable number of epochs.
+3. **CEGIS refinement** – generate failure states with a Cross‑Entropy Method (CEM), let the expert correct them, and retrain on the combined data.
+
+## CEGIS Loop (`cegis_loop.py`)
+- Generates a population of 2,000 candidate states and evaluates them with a Signal Temporal Logic (STL) score.
+- Failures are fixed by the expert (`fix_and_merge`) and added to the training buffer.
+- Logs the number of failures, safety coverage, and loss after each cycle.
+
+## Evaluation (`evaluate.py`)
+- Loads a saved checkpoint and runs a number of rollouts.
+- Reports the success rate for visiting checkpoints in order and the average number of checkpoints reached.
+- Can optionally plot a single trajectory with checkpoint markers.
+
+## Current Status
+- A 45‑minute run on a free Tesla T4 GPU showed the model can reach checkpoints A and B reliably.
+- Docking still fails; the model needs more training steps.
+- The new Muon optimizer is expected to double the learning speed.
+
+## How to Run
+```bash
+# Clone the repository
+git clone https://github.com/varun29-git/NNCS-Mamba.git
+cd NNCS-Mamba
+
+# Install dependencies (requires a CUDA‑enabled machine)
+pip install -r requirements.txt
+
+# Run the full training and CEGIS loop
+python train.py --epochs 10 --cegis-cycles 5
+
+# Evaluate a saved checkpoint
+python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot
+```
+
+Feel free to open issues or pull requests as the project evolves.
