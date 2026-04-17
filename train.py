@@ -36,7 +36,7 @@ from cegis_loop import falsify_cem, fix_and_merge
 # =============================================================================
 # Helper: CPU-Backed Dataloader (Prevents T4 OOM Errors)
 # =============================================================================
-def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=4):
+def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=2):
     """Converts the list of trajectories into CPU-bound PyTorch DataLoaders."""
     data_list = list(dataset)
     np.random.shuffle(data_list)

@@ -83,7 +83,7 @@ class MambaController(LearnerController, nn.Module):
         self.criterion = nn.MSELoss()
         self.use_amp = self.device.type == "cuda"
         if self.use_amp:
-            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            self.grad_scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         else:
             self.grad_scaler = None
 
@@ -229,8 +229,8 @@ class MambaController(LearnerController, nn.Module):
             for batch_obs, batch_act, batch_next in loader:
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 batch_next = batch_next.to(self.device, non_blocking=True)
-                # Safe autocast for PyTorch < 2.4/unified API
-                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode()
+                # Safe autocast for PyTorch unified API
+                context = torch.amp.autocast('cuda', enabled=self.use_amp) if self.use_amp else torch.inference_mode()
                 with context:
                     pred_act, pred_next = self._forward_sequence(batch_obs)
                     # 0.5 Weighting for physics projection relative to imitation
@@ -290,8 +290,8 @@ class MambaController(LearnerController, nn.Module):
                 # Apply Gaussian noise to expert X/Y/Z positions (indices 0:3) to combat covariate shift
                 noisy_obs[..., 0:3] = noisy_obs[..., 0:3] + torch.randn_like(noisy_obs[..., 0:3]) * self.noise_std
 
-                # Safe autocast for PyTorch < 2.4/unified API
-                context = torch.cuda.amp.autocast(enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
+                # Safe autocast for PyTorch unified API
+                context = torch.amp.autocast('cuda', enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
                 with context:
                     pred_act, pred_next = self._forward_sequence_from_normalized(noisy_obs)
                     loss = self.criterion(pred_act, batch_act) + 0.5 * self.criterion(pred_next, batch_next)
