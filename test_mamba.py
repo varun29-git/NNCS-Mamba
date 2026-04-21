@@ -2,8 +2,8 @@ import numpy as np
 from mamba_learner import MambaController
 
 def test_mamba_training():
-    obs_dim = 3
-    action_dim = 2
+    obs_dim = 15
+    action_dim = 4
     
     # Initialize Mamba Controller
     controller = MambaController(obs_dim=obs_dim, action_dim=action_dim, d_model=32, d_state=8, num_layers=2)
@@ -13,8 +13,8 @@ def test_mamba_training():
     for _ in range(5):
         seq_len = 20
         obs_seq = np.random.randn(seq_len, obs_dim)
-        # Dummy "expert": just a basic linear combination
-        act_seq = obs_seq[:, :2] * 0.5 + 0.1 
+        # Dummy "expert": just a basic linear combination of the first four channels
+        act_seq = obs_seq[:, :4] * 0.5 + 0.1
         dataset.append((obs_seq, act_seq))
         
     print("Training Mamba Controller...")

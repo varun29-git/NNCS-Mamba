@@ -22,6 +22,9 @@ class MambaController(LearnerController, nn.Module):
         d_state: int = 16,
         num_layers: int = 2,
         lr: float = 1e-4,
+        optimizer_name: str = "split_muon",
+        use_gradient_checkpointing: bool = True,
+        aux_state_weight: float = 0.5,
     ):
         nn.Module.__init__(self)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -39,14 +42,23 @@ class MambaController(LearnerController, nn.Module):
         self.obs_norm_eps = 1e-6
         self.grad_clip_norm = 1.0
         self.normalizer_fitted = False
-        
+        self.optimizer_name = optimizer_name
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.aux_state_weight = aux_state_weight
+
         self.register_buffer("obs_mean", torch.zeros(obs_dim, dtype=torch.float32))
         self.register_buffer("obs_scale", torch.ones(obs_dim, dtype=torch.float32))
         self.input_norm = nn.LayerNorm(obs_dim)
         self.input_layer = nn.Linear(obs_dim, d_model)
-        
+
         self.mamba_blocks = nn.ModuleList([
-            MambaBlock(d_model=d_model, d_state=d_state, d_conv=4, expand=2)
+            MambaBlock(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=4,
+                expand=2,
+                use_checkpointing=use_gradient_checkpointing,
+            )
             for _ in range(num_layers)
         ])
         self.norms = nn.ModuleList([
@@ -60,19 +72,24 @@ class MambaController(LearnerController, nn.Module):
         self.layer_caches = []
 
         self.to(self.device)
-        
-        # Muon + AdamW Brain Split Optimizer Setup
-        muon_params = []
-        adam_params = []
-        for name, param in self.named_parameters():
-            if param.ndim == 2:
-                muon_params.append(param)
-            else:
-                adam_params.append(param)
-        
-        # Consistent with standard Muon usage: Higher LR for Muon, baseline for AdamW
-        self.optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
-        self.optimizer_adamw = torch.optim.AdamW(adam_params, lr=lr, weight_decay=0.01)
+
+        if optimizer_name == "split_muon":
+            muon_params = []
+            adam_params = []
+            for _, param in self.named_parameters():
+                if param.ndim == 2:
+                    muon_params.append(param)
+                else:
+                    adam_params.append(param)
+
+            # Consistent with standard Muon usage: Higher LR for Muon, baseline for AdamW
+            self.optimizer_muon = Muon(muon_params, lr=0.02, momentum=0.95)
+            self.optimizer_adamw = torch.optim.AdamW(adam_params, lr=lr, weight_decay=0.01)
+        elif optimizer_name == "adamw":
+            self.optimizer_muon = None
+            self.optimizer_adamw = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.01)
+        else:
+            raise ValueError(f"Unsupported optimizer_name: {optimizer_name}")
         
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_adamw,
@@ -101,6 +118,9 @@ class MambaController(LearnerController, nn.Module):
             "lr": self.current_lr,
             "noise_std": self.noise_std,
             "grad_clip_norm": self.grad_clip_norm,
+            "optimizer_name": self.optimizer_name,
+            "use_gradient_checkpointing": self.use_gradient_checkpointing,
+            "aux_state_weight": self.aux_state_weight,
         }
         
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
@@ -203,16 +223,20 @@ class MambaController(LearnerController, nn.Module):
         obs_list = [item[0] for item in dataset]
         act_list = [item[1] for item in dataset]
 
-        obs_tensor = torch.tensor(np.stack(obs_list), dtype=torch.float32)
-        act_tensor = torch.tensor(np.stack(act_list), dtype=torch.float32)
-        tensor_dataset = TensorDataset(obs_tensor, act_tensor)
+        obs_tensor = torch.from_numpy(np.stack(obs_list).astype(np.float32, copy=False))
+        act_tensor = torch.from_numpy(np.stack(act_list).astype(np.float32, copy=False))
+        obs_in = obs_tensor[:, :-1, :]
+        act_in = act_tensor[:, :-1, :]
+        next_obs = obs_tensor[:, 1:, :12]
+        tensor_dataset = TensorDataset(obs_in, act_in, next_obs)
         if pin_memory is None:
             pin_memory = self.device.type == "cuda"
+        effective_num_workers = num_workers if self.device.type == "cuda" else 0
         return DataLoader(
             tensor_dataset,
             batch_size=batch_size,
             shuffle=shuffle,
-            num_workers=num_workers,
+            num_workers=effective_num_workers,
             pin_memory=pin_memory,
         )
 
@@ -233,8 +257,7 @@ class MambaController(LearnerController, nn.Module):
                 context = torch.amp.autocast('cuda', enabled=self.use_amp) if self.use_amp else torch.inference_mode()
                 with context:
                     pred_act, pred_next = self._forward_sequence(batch_obs)
-                    # 0.5 Weighting for physics projection relative to imitation
-                    loss = self.criterion(pred_act, batch_act) + 0.5 * self.criterion(pred_next, batch_next)
+                    loss = self.criterion(pred_act, batch_act) + self.aux_state_weight * self.criterion(pred_next, batch_next)
                 total_loss += loss.item()
                 batches_processed += 1
 
@@ -281,8 +304,9 @@ class MambaController(LearnerController, nn.Module):
             for batch_obs, batch_act, batch_next in train_loader:
                 batch_obs, batch_act = self._move_batch_to_device(batch_obs, batch_act)
                 batch_next = batch_next.to(self.device, non_blocking=True)
-                
-                self.optimizer_muon.zero_grad(set_to_none=True)
+
+                if self.optimizer_muon is not None:
+                    self.optimizer_muon.zero_grad(set_to_none=True)
                 self.optimizer_adamw.zero_grad(set_to_none=True)
                 
                 normalized_obs = self._normalize_observations(batch_obs)
@@ -294,20 +318,23 @@ class MambaController(LearnerController, nn.Module):
                 context = torch.amp.autocast('cuda', enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
                 with context:
                     pred_act, pred_next = self._forward_sequence_from_normalized(noisy_obs)
-                    loss = self.criterion(pred_act, batch_act) + 0.5 * self.criterion(pred_next, batch_next)
+                    loss = self.criterion(pred_act, batch_act) + self.aux_state_weight * self.criterion(pred_next, batch_next)
 
                 if self.grad_scaler:
                     self.grad_scaler.scale(loss).backward()
-                    self.grad_scaler.unscale_(self.optimizer_muon)
+                    if self.optimizer_muon is not None:
+                        self.grad_scaler.unscale_(self.optimizer_muon)
                     self.grad_scaler.unscale_(self.optimizer_adamw)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.grad_scaler.step(self.optimizer_muon)
+                    if self.optimizer_muon is not None:
+                        self.grad_scaler.step(self.optimizer_muon)
                     self.grad_scaler.step(self.optimizer_adamw)
                     self.grad_scaler.update()
                 else:
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.grad_clip_norm)
-                    self.optimizer_muon.step()
+                    if self.optimizer_muon is not None:
+                        self.optimizer_muon.step()
                     self.optimizer_adamw.step()
 
                 total_loss += loss.item()
@@ -339,13 +366,14 @@ class MambaController(LearnerController, nn.Module):
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "model_state_dict": self.state_dict(),
-            "optimizer_muon_state_dict": self.optimizer_muon.state_dict(),
             "optimizer_adamw_state_dict": self.optimizer_adamw.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "config": self.get_config(),
             "metadata": metadata,
             "normalizer_fitted": self.normalizer_fitted,
         }
+        if self.optimizer_muon is not None:
+            payload["optimizer_muon_state_dict"] = self.optimizer_muon.state_dict()
         torch.save(payload, checkpoint_path)
 
     def load_checkpoint(self, path: str, map_location: Optional[str] = None) -> Dict[str, Any]:
@@ -353,7 +381,7 @@ class MambaController(LearnerController, nn.Module):
         self.load_state_dict(checkpoint["model_state_dict"])
         
         # New split optimizer loading
-        if "optimizer_muon_state_dict" in checkpoint:
+        if self.optimizer_muon is not None and "optimizer_muon_state_dict" in checkpoint:
             self.optimizer_muon.load_state_dict(checkpoint["optimizer_muon_state_dict"])
         if "optimizer_adamw_state_dict" in checkpoint:
             self.optimizer_adamw.load_state_dict(checkpoint["optimizer_adamw_state_dict"])

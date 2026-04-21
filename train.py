@@ -27,10 +27,49 @@ from torch.utils.data import DataLoader, TensorDataset
 # Enable TF32 for optimal performance on A100 GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS
 from mamba_learner import MambaController
-from cegis_loop import falsify_cem, fix_and_merge
+from cegis_loop import falsify_cem
+
+
+PROFILE_OVERRIDES = {
+    "default": {},
+    "t4-fast": {
+        "d_model": 96,
+        "d_state": 16,
+        "layers": 2,
+        "lr": 3e-4,
+        "batch_size": 16,
+        "num_traj": 1500,
+        "seq_steps": 200,
+        "epochs": 6,
+        "cegis_cycles": 1,
+        "optimizer": "adamw",
+        "num_workers": 2,
+        "val_split": 0.10,
+        "max_hours": 1.25,
+        "cegis_pop_size": 512,
+        "cegis_generations": 1,
+        "cegis_retrain_epochs": 2,
+        "disable_gradient_checkpointing": True,
+    },
+}
+
+
+def apply_profile(args, defaults):
+    overrides = PROFILE_OVERRIDES.get(args.profile, {})
+    for key, value in overrides.items():
+        if getattr(args, key) == defaults[key]:
+            setattr(args, key, value)
+
+
+def build_dataset_cache_path(args):
+    cache_dir = Path("cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"baseline_dataset_profile-{args.profile}_traj-{args.num_traj}_steps-{args.seq_steps}.pt"
 
 
 # =============================================================================
@@ -48,33 +87,36 @@ def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=2):
     def to_dataset(raw_list):
         if not raw_list:
             return None
-        # KEEP ON CPU: Do not use device='cuda' here!
-        # The MambaController will move batches to GPU during training.
-        o_np = np.stack([x[0] for x in raw_list])
-        a_np = np.stack([x[1] for x in raw_list])
-        
-        o = torch.tensor(o_np, dtype=torch.float32)
-        a = torch.tensor(a_np, dtype=torch.float32)
-        
+        o = torch.from_numpy(np.stack([x[0] for x in raw_list]).astype(np.float32, copy=False))
+        a = torch.from_numpy(np.stack([x[1] for x in raw_list]).astype(np.float32, copy=False))
         # Sequentially map input causality
         o_in = o[:, :-1, :]
         a_in = a[:, :-1, :]
-        
-        # Target isolation (Extract 12D continuous physics parameters representing the literal t+1 step)
         next_o = o[:, 1:, 0:12]
-        
         return TensorDataset(o_in, a_in, next_o)
 
     train_ds = to_dataset(train_raw)
     val_ds = to_dataset(val_raw)
+    effective_num_workers = num_workers if torch.cuda.is_available() else 0
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "pin_memory": torch.cuda.is_available(),
+        "num_workers": effective_num_workers,
+        "persistent_workers": effective_num_workers > 0,
+    }
+    if effective_num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, pin_memory=True,
-        num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None
+        train_ds,
+        shuffle=True,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, pin_memory=True,
-        num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None
+        val_ds,
+        shuffle=False,
+        **loader_kwargs,
     ) if val_ds else None
 
     return train_loader, val_loader
@@ -99,18 +141,17 @@ def generate_expert_data(num_traj, seq_steps, dt):
         expert.reset()
         expert.set_plant_ref(plant)
 
-        o_seq, a_seq = [], []
-        for _ in range(seq_steps):
+        o_seq = np.empty((seq_steps, 15), dtype=np.float32)
+        a_seq = np.empty((seq_steps, 4), dtype=np.float32)
+        for step_idx in range(seq_steps):
             u = expert.compute_action(y)
-            # Explicitly append target waypoint coordinates to input (Covariate Shift Fix)
             target = CHECKPOINTS[expert.phase_idx]
-            y_with_target = np.concatenate([y, target])
-            
-            o_seq.append(y_with_target)
-            a_seq.append(u)
+            o_seq[step_idx, :12] = y
+            o_seq[step_idx, 12:] = target
+            a_seq[step_idx] = u
             y = plant.step(u, dt)
 
-        dataset.append((np.array(o_seq, dtype=np.float32), np.array(a_seq, dtype=np.float32)))
+        dataset.append((o_seq, a_seq))
         if (i + 1) % 500 == 0:
             print(f"    ...generated {i + 1}/{num_traj}")
 
@@ -125,17 +166,18 @@ def fix_and_merge(failures, expert, plant, buffer, seq_steps, dt):
         expert.reset()
         expert.set_plant_ref(plant)
         
-        o_seq, a_seq = [], []
+        o_seq = np.empty((seq_steps, 15), dtype=np.float32)
+        a_seq = np.empty((seq_steps, 4), dtype=np.float32)
         y = state.copy()
-        for _ in range(seq_steps):
+        for step_idx in range(seq_steps):
             u = expert.compute_action(y)
-            # 15D concatenation for consistency
             target = CHECKPOINTS[expert.phase_idx]
-            o_seq.append(np.concatenate([y, target]))
-            a_seq.append(u)
+            o_seq[step_idx, :12] = y
+            o_seq[step_idx, 12:] = target
+            a_seq[step_idx] = u
             y = plant.step(u, dt)
             
-        buffer.append((np.array(o_seq, dtype=np.float32), np.array(a_seq, dtype=np.float32)))
+        buffer.append((o_seq, a_seq))
 
 
 
@@ -155,15 +197,20 @@ def run_smoke(controller, args, outdir):
 def run_imitation(controller, args, outdir, dataset, global_start_time):
     """Pure imitation learning from expert demonstrations."""
     print("\n=== PHASE: BASELINE IMITATION ===")
-    train_loader, val_loader = create_cpu_dataloaders(dataset, args.batch_size)
+    train_loader, val_loader = create_cpu_dataloaders(
+        dataset,
+        args.batch_size,
+        val_split=args.val_split,
+        num_workers=args.num_workers,
+    )
 
     best_val_loss = float("inf")
     csv_log = open(outdir / "imitation_log.csv", "w")
     csv_log.write("epoch,train_loss,val_loss,lr\n")
 
     for epoch in range(1, args.epochs + 1):
-        if time.time() - global_start_time > 2.5 * 3600:
-            print("[!] Time limit reached (2.5 hours). Gracefully exiting Imitation Phase...")
+        if time.time() - global_start_time > args.max_hours * 3600:
+            print(f"[!] Time limit reached ({args.max_hours:.2f} hours). Gracefully exiting Imitation Phase...")
             break
             
         metrics = controller.update(
@@ -203,10 +250,12 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
     csv_log = open(outdir / "cegis_log.csv", "w")
     csv_log.write("cycle,fails,coverage,train_loss,val_loss\n")
+    best_coverage = -float("inf")
+    best_val_loss = float("inf")
 
     for cycle in range(1, args.cegis_cycles + 1):
-        if time.time() - global_start_time > 2.5 * 3600:
-            print("[!] Time limit reached (2.5 hours). Gracefully exiting CEGIS Phase...")
+        if time.time() - global_start_time > args.max_hours * 3600:
+            print(f"[!] Time limit reached ({args.max_hours:.2f} hours). Gracefully exiting CEGIS Phase...")
             break
         
         print(f"\n--- CEGIS Cycle {cycle}/{args.cegis_cycles} ---")
@@ -214,12 +263,14 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         # 1. Hunt for failures
         print("[*] Falsifier hunting for edge cases...")
         failures = falsify_cem(
-            controller, plant, expert, num_generations=3, pop_size=2000, 
+            controller, plant, expert,
+            num_generations=args.cegis_generations,
+            pop_size=args.cegis_pop_size,
             elite_frac=0.2, seq_steps=args.seq_steps, dt=0.1,
         )
 
         num_fails = len(failures)
-        coverage = (1.0 - min(1.0, num_fails / 2000.0)) * 100
+        coverage = (1.0 - min(1.0, num_fails / float(args.cegis_pop_size))) * 100
         print(f"    Found {num_fails} unique failures. Safety Coverage: {coverage:.2f}%")
 
         if num_fails == 0:
@@ -233,18 +284,22 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
         # 3. Retrain (Prioritized Experience Replay)
         target_cegis_size = int(len(dataset) * (0.3 / 0.7))
+        mixed_dataset = list(dataset)
         if len(cegis_buffer) > 0:
             import random
             upsampled_cegis = random.choices(cegis_buffer, k=target_cegis_size)
-            mixed_dataset = dataset + upsampled_cegis
-        else:
-            mixed_dataset = dataset
+            mixed_dataset.extend(upsampled_cegis)
 
         print(f"[*] Retraining PER (Size: {len(mixed_dataset)} | Baseline: {len(dataset)} | Recovery: {len(mixed_dataset)-len(dataset)})...")
-        train_loader, val_loader = create_cpu_dataloaders(mixed_dataset, args.batch_size)
+        train_loader, val_loader = create_cpu_dataloaders(
+            mixed_dataset,
+            args.batch_size,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+        )
         metrics = controller.update(
             train_loader, val_loader,
-            epochs=5,
+            epochs=args.cegis_retrain_epochs,
             fit_normalizer=(cycle == 1 and not controller.normalizer_fitted),
         )
         t_loss = metrics["train_loss"]
@@ -255,6 +310,11 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
         # Save progress
         controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), phase="cegis", cycle=cycle)
+        if coverage > best_coverage or (coverage == best_coverage and v_loss < best_val_loss):
+            best_coverage = coverage
+            best_val_loss = v_loss
+            controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
+            print("   -> Saved new best CEGIS checkpoint.")
 
     csv_log.close()
     controller.save_checkpoint(str(outdir / "last_cegis.pt"), phase="cegis", cycle=args.cegis_cycles)
@@ -268,6 +328,7 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 def main():
     parser = argparse.ArgumentParser(description="NNCS-Mamba Robust Trainer")
     parser.add_argument("--phase", choices=["smoke", "imitation", "cegis", "all"], required=True)
+    parser.add_argument("--profile", choices=sorted(PROFILE_OVERRIDES.keys()), default="default")
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
 
@@ -277,15 +338,43 @@ def main():
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--optimizer", choices=["split_muon", "adamw"], default="split_muon")
+    parser.add_argument("--disable-gradient-checkpointing", action="store_true")
 
     # Data & Training
     parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--cegis-cycles", type=int, default=5)
+    parser.add_argument("--cegis-pop-size", type=int, default=2000)
+    parser.add_argument("--cegis-generations", type=int, default=3)
+    parser.add_argument("--cegis-retrain-epochs", type=int, default=5)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--max-hours", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=42)
 
+    defaults = {
+        "d_model": 128,
+        "d_state": 16,
+        "layers": 3,
+        "lr": 3e-4,
+        "batch_size": 32,
+        "optimizer": "split_muon",
+        "disable_gradient_checkpointing": False,
+        "num_traj": 5000,
+        "seq_steps": 300,
+        "epochs": 10,
+        "cegis_cycles": 5,
+        "cegis_pop_size": 2000,
+        "cegis_generations": 3,
+        "cegis_retrain_epochs": 5,
+        "num_workers": 2,
+        "val_split": 0.15,
+        "max_hours": 2.5,
+    }
     args = parser.parse_args()
+    apply_profile(args, defaults)
     
     global_start_time = time.time()
 
@@ -309,8 +398,11 @@ def main():
         obs_dim=15, action_dim=4,
         d_model=args.d_model, d_state=args.d_state,
         num_layers=args.layers, lr=args.lr,
+        optimizer_name=args.optimizer,
+        use_gradient_checkpointing=not args.disable_gradient_checkpointing,
     )
     print(f"    Device: {controller.device}")
+    print(f"    Profile: {args.profile} | Optimizer: {args.optimizer} | Gradient checkpointing: {not args.disable_gradient_checkpointing}")
 
     # NOTE: torch.compile disabled — CUDA Graphs consume ~1.2GB extra VRAM
     # which causes OOM on A100 MIG 3g.20gb (19.5GB) slices. The sequential
@@ -327,7 +419,7 @@ def main():
 
     # ── Dataset Management ──
     # Cache the baseline dataset to avoid re-harvesting (saves 5-10 mins on restart)
-    cache_path = Path("baseline_dataset.pt")
+    cache_path = build_dataset_cache_path(args)
     dataset = deque(maxlen=args.num_traj + 1000)
     
     if cache_path.exists() and args.num_traj > 0:
@@ -335,13 +427,14 @@ def main():
         try:
             cached_data = torch.load(cache_path, weights_only=False)
             
-            # DIMENSION CHECK: If cache is old 12D, invalidate it
-            sample_obs = cached_data[0][0] # First traj, first step
-            if sample_obs.shape[-1] != 15:
-                print(f"[!] Cache dimension mismatch ({sample_obs.shape[-1]}D != 15D). Invalidating cache...")
+            sample_obs = cached_data[0][0]
+            if sample_obs.shape[-1] != 15 or sample_obs.shape[0] != args.seq_steps:
+                print(
+                    f"[!] Cache shape mismatch ({tuple(sample_obs.shape)} != ({args.seq_steps}, 15)). "
+                    "Invalidating cache..."
+                )
                 raise ValueError("Old cache format")
                 
-            # If the user requested a different number of trajectories, adjust
             if len(cached_data) > args.num_traj:
                 cached_data = cached_data[:args.num_traj]
             dataset.extend(cached_data)

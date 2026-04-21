@@ -33,6 +33,7 @@ class MambaBlock(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        use_checkpointing: bool = True,
         dt_rank: str = "auto",
         dt_min: float = 0.001,
         dt_max: float = 0.1,
@@ -46,6 +47,7 @@ class MambaBlock(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
+        self.use_checkpointing = use_checkpointing
 
         if dt_rank == "auto":
             self.dt_rank = math.ceil(self.d_model / 16)
@@ -101,7 +103,7 @@ class MambaBlock(nn.Module):
         """
         x: [Batch, SeqLen, D_Model]
         """
-        if self.training and cache is None:
+        if self.training and cache is None and self.use_checkpointing:
             # Trade compute for memory using gradient checkpointing during parallel scan phase
             # use_reentrant=False is the PyTorch >= 2.0 standard
             return checkpoint(self._forward_impl, x, use_reentrant=False)

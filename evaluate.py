@@ -32,12 +32,23 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Load model (must match training architecture: 15D input, 512-dim, 6 layers)
-    controller = MambaController(obs_dim=15, action_dim=4, d_model=128, d_state=16, num_layers=3)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    config = checkpoint.get("config", {})
+    controller = MambaController(
+        obs_dim=config.get("obs_dim", 15),
+        action_dim=config.get("action_dim", 4),
+        d_model=config.get("d_model", 128),
+        d_state=config.get("d_state", 16),
+        num_layers=config.get("num_layers", 3),
+        lr=config.get("lr", 3e-4),
+        optimizer_name=config.get("optimizer_name", "split_muon"),
+        use_gradient_checkpointing=config.get("use_gradient_checkpointing", True),
+        aux_state_weight=config.get("aux_state_weight", 0.5),
+    )
     checkpoint = controller.load_checkpoint(args.checkpoint)
     meta = checkpoint.get("metadata", {})
     print(f"Loaded: {args.checkpoint}")
-    print(f"  Phase: {meta.get('phase', '?')}  Epoch/Cycle: {meta.get('epoch', '?')}")
+    print(f"  Phase: {meta.get('phase', '?')}  Epoch/Cycle: {meta.get('epoch', meta.get('cycle', '?'))}")
     print()
 
     plant = DronePlant(m0=2.5, fuel_rate=0.02, m_min=1.0)
