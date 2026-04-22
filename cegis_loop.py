@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
-from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS, compute_drone_derivatives
+from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS, FORCE_LIMIT, compute_drone_derivatives
 from mamba_learner import MambaController
 
 
@@ -158,7 +158,7 @@ def plot_trajectory(mamba_traj, expert_traj, cycle, filename="trajectory_compari
     axes[3].legend(loc='upper right')
     axes[3].grid(True, alpha=0.3)
     
-    plt.suptitle(f'CEGIS Iteration {cycle}: Mamba vs Expert (A→B→C→Dock)', fontsize=14)
+    plt.suptitle(f'CEGIS Iteration {cycle}: Controller vs Expert (A→B→C→Dock)', fontsize=14)
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
     plt.close()
@@ -209,7 +209,7 @@ def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=2000
             
             with torch.no_grad():
                 u = mamba_ctrl._run_cached_step(obs_tensor).squeeze(1) # [B, 4]
-            u = torch.clamp(u, -20.0, 20.0)
+            u = torch.clamp(u, -FORCE_LIMIT, FORCE_LIMIT)
             
             # Vectorized plant step
             # Dynamic hidden mass equation: max(1.0, 2.5 - 0.02 * time)

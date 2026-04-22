@@ -12,6 +12,8 @@ CHECKPOINT_C = np.array([3.0, -5.0, 3.0])
 DOCK_ORIGIN  = np.array([0.0, 0.0, 0.0])
 CHECKPOINTS  = [CHECKPOINT_A, CHECKPOINT_B, CHECKPOINT_C, DOCK_ORIGIN]
 CHECKPOINT_RADIUS = 1.5  # proximity threshold to "visit" a checkpoint
+# Force commands must exceed m0 * g (~24.5 N at m0=2.5 kg) or the drone cannot hover.
+FORCE_LIMIT = 30.0
 
 
 class DronePlant(Plant):
@@ -53,7 +55,7 @@ class DronePlant(Plant):
         
     def step(self, u: np.ndarray, dt: float) -> np.ndarray:
         # Physical actuator clipping — these are FORCE commands now
-        u = np.clip(u, -20.0, 20.0)
+        u = np.clip(u, -FORCE_LIMIT, FORCE_LIMIT)
         Fx_cmd, Fy_cmd, Fz_cmd, yaw_rate_cmd = u
         
         # Update mass (fuel consumption)
@@ -150,7 +152,7 @@ class DroneExpertController(ExpertController):
         force_cmd = acc_desired * mass
         
         # Clip to actuator limits
-        force_cmd = np.clip(force_cmd, -15.0, 15.0)
+        force_cmd = np.clip(force_cmd, -FORCE_LIMIT, FORCE_LIMIT)
         
         return np.array([force_cmd[0], force_cmd[1], force_cmd[2], 0.0])
 
@@ -163,7 +165,7 @@ def compute_drone_derivatives(state: torch.Tensor, u: torch.Tensor, time_t: torc
     Pure PyTorch functional kernel to compute 12D drone derivatives.
     Compatible with torch.vmap for massive batch parallel processing.
     """
-    u_clipped = torch.clamp(u, -20.0, 20.0)
+    u_clipped = torch.clamp(u, -FORCE_LIMIT, FORCE_LIMIT)
     Fx_cmd, Fy_cmd, Fz_cmd, yaw_rate_cmd = u_clipped[0], u_clipped[1], u_clipped[2], u_clipped[3]
     
     ax_cmd = Fx_cmd / mass

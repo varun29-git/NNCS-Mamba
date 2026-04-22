@@ -34,7 +34,7 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS
-from drone_env import CHECKPOINT_RADIUS
+from drone_env import CHECKPOINT_RADIUS, FORCE_LIMIT
 from controller_factory import build_controller
 from cegis_loop import falsify_cem
 
@@ -85,9 +85,31 @@ PROFILE_OVERRIDES = {
         "late_timestep_weight": 2.5,
         "recurrent_dropout": 0.1,
     },
+    "t4-generalize": {
+        "controller": "structured_gru",
+        "d_model": 256,
+        "d_state": 16,
+        "layers": 2,
+        "lr": 2e-4,
+        "batch_size": 16,
+        "num_traj": 8192,
+        "seq_steps": 300,
+        "epochs": 18,
+        "optimizer": "adamw",
+        "num_workers": 2,
+        "val_split": 0.10,
+        "max_hours": 2.8,
+        "cegis_cycles": 1,
+        "cegis_pop_size": 128,
+        "cegis_generations": 1,
+        "cegis_retrain_epochs": 1,
+        "disable_gradient_checkpointing": True,
+        "late_timestep_weight": 1.5,
+        "recurrent_dropout": 0.1,
+    },
 }
 
-DATASET_CACHE_VERSION = "v2"
+DATASET_CACHE_VERSION = "v3"
 
 
 def apply_profile(args, defaults):
@@ -198,7 +220,7 @@ def generate_expert_data(num_traj, seq_steps, dt):
             acc_desired[:, 2] += 9.81
 
             masses = np.maximum(1.0, 2.5 - 0.02 * times).astype(np.float32)
-            force_cmd = np.clip(acc_desired * masses[:, None], -15.0, 15.0).astype(np.float32)
+            force_cmd = np.clip(acc_desired * masses[:, None], -FORCE_LIMIT, FORCE_LIMIT).astype(np.float32)
             action = np.zeros((batch, 4), dtype=np.float32)
             action[:, 0:3] = force_cmd
 
@@ -402,11 +424,14 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
         # Save progress
         controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), phase="cegis", cycle=cycle)
-        if coverage > best_coverage or (coverage == best_coverage and v_loss < best_val_loss):
+        meaningful_coverage = coverage > 0.0
+        if meaningful_coverage and (coverage > best_coverage or (coverage == best_coverage and v_loss < best_val_loss)):
             best_coverage = coverage
             best_val_loss = v_loss
             controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
             print("   -> Saved new best CEGIS checkpoint.")
+        elif not meaningful_coverage:
+            print("   -> CEGIS coverage stayed at 0.00%; keeping imitation checkpoint as the recommended model.")
 
     csv_log.close()
     controller.save_checkpoint(str(outdir / "last_cegis.pt"), phase="cegis", cycle=args.cegis_cycles)
@@ -423,7 +448,7 @@ def main():
     parser.add_argument("--profile", choices=sorted(PROFILE_OVERRIDES.keys()), default="default")
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
-    parser.add_argument("--controller", choices=["mamba", "gru"], default="mamba")
+    parser.add_argument("--controller", choices=["mamba", "gru", "structured_gru"], default="mamba")
 
     # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
     parser.add_argument("--d-model", type=int, default=128)
@@ -473,8 +498,8 @@ def main():
     }
     args = parser.parse_args()
     apply_profile(args, defaults)
-    if args.controller == "gru" and args.optimizer != "adamw":
-        print("[*] Switching optimizer to AdamW for GRU controller.")
+    if args.controller in {"gru", "structured_gru"} and args.optimizer != "adamw":
+        print("[*] Switching optimizer to AdamW for recurrent controller.")
         args.optimizer = "adamw"
     
     global_start_time = time.time()

@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from gru_learner import GRUController
 from mamba_learner import MambaController
+from structured_gru_learner import StructuredGRUController
 
 
 def build_controller(
@@ -35,6 +36,20 @@ def build_controller(
         )
     if controller_key == "gru":
         return GRUController(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            d_model=d_model,
+            d_state=d_state,
+            num_layers=num_layers,
+            lr=lr,
+            optimizer_name="adamw",
+            use_gradient_checkpointing=False,
+            aux_state_weight=aux_state_weight,
+            late_timestep_weight=late_timestep_weight,
+            recurrent_dropout=recurrent_dropout,
+        )
+    if controller_key == "structured_gru":
+        return StructuredGRUController(
             obs_dim=obs_dim,
             action_dim=action_dim,
             d_model=d_model,

@@ -7,6 +7,7 @@ import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
+from drone_env import FORCE_LIMIT
 from mamba_block import MambaBlock, MambaCache
 from muon_optimizer import Muon
 
@@ -240,7 +241,7 @@ class MambaController(LearnerController, nn.Module):
             obs_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(1, 1, -1)
             out = self._run_cached_step(obs_tensor)
 
-            return np.clip(out[0, 0, :].cpu().numpy(), -20.0, 20.0)
+            return np.clip(out[0, 0, :].cpu().numpy(), -FORCE_LIMIT, FORCE_LIMIT)
 
     def _build_loader_from_dataset(
         self,

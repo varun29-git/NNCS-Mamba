@@ -11,27 +11,34 @@ from abstract_env import LearnerController
 from drone_env import FORCE_LIMIT
 
 
-class GRUController(LearnerController, nn.Module):
+class StructuredGRUController(LearnerController, nn.Module):
     """
-    T4-friendly recurrent controller.
+    Higher-capacity recurrent controller with physics-informed action synthesis.
 
-    Uses cuDNN-backed GRU kernels for much better wall-clock efficiency than the
-    pure PyTorch Mamba scan while preserving the same online inference contract.
+    Instead of asking the network to emit force commands from scratch, it learns
+    a latent state that estimates hidden mass and adds a bounded residual on top
+    of an analytic PD-style controller. This is a much stronger inductive bias
+    for the drone task and tends to generalize better per unit of wall clock.
     """
 
     def __init__(
         self,
         obs_dim: int,
         action_dim: int,
-        d_model: int = 192,
+        d_model: int = 256,
         d_state: int = 16,
         num_layers: int = 2,
-        lr: float = 3e-4,
+        lr: float = 2e-4,
         optimizer_name: str = "adamw",
         use_gradient_checkpointing: bool = False,
         aux_state_weight: float = 0.5,
         late_timestep_weight: float = 1.0,
         recurrent_dropout: float = 0.1,
+        mass_loss_weight: float = 0.35,
+        residual_loss_weight: float = 0.01,
+        residual_force_limit: float = 6.0,
+        min_mass: float = 1.0,
+        max_mass: float = 2.5,
     ):
         nn.Module.__init__(self)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,7 +52,7 @@ class GRUController(LearnerController, nn.Module):
         self.max_batch_size = 1
         self.noise_std = 0.01
         self.default_epochs = 4
-        self.default_batch_size = 64
+        self.default_batch_size = 32
         self.obs_norm_eps = 1e-6
         self.grad_clip_norm = 1.0
         self.normalizer_fitted = False
@@ -54,6 +61,11 @@ class GRUController(LearnerController, nn.Module):
         self.aux_state_weight = aux_state_weight
         self.late_timestep_weight = late_timestep_weight
         self.recurrent_dropout = recurrent_dropout
+        self.mass_loss_weight = mass_loss_weight
+        self.residual_loss_weight = residual_loss_weight
+        self.residual_force_limit = residual_force_limit
+        self.min_mass = min_mass
+        self.max_mass = max_mass
 
         self.register_buffer("obs_mean", torch.zeros(obs_dim, dtype=torch.float32))
         self.register_buffer("obs_scale", torch.ones(obs_dim, dtype=torch.float32))
@@ -72,7 +84,9 @@ class GRUController(LearnerController, nn.Module):
             nn.SiLU(),
             nn.Linear(d_model * 2, d_model),
         )
-        self.action_head = nn.Linear(d_model, action_dim)
+
+        self.mass_head = nn.Linear(d_model, 1)
+        self.residual_head = nn.Linear(d_model, action_dim)
         self.state_head = nn.Linear(d_model, 12)
 
         self.hidden_state: Optional[torch.Tensor] = None
@@ -80,7 +94,7 @@ class GRUController(LearnerController, nn.Module):
         self.to(self.device)
 
         if optimizer_name != "adamw":
-            raise ValueError("GRUController currently supports optimizer_name='adamw' only")
+            raise ValueError("StructuredGRUController currently supports optimizer_name='adamw' only")
         self.optimizer_adamw = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=0.01)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer_adamw,
@@ -109,8 +123,10 @@ class GRUController(LearnerController, nn.Module):
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
-        nn.init.xavier_uniform_(self.action_head.weight)
-        nn.init.zeros_(self.action_head.bias)
+        nn.init.xavier_uniform_(self.mass_head.weight)
+        nn.init.zeros_(self.mass_head.bias)
+        nn.init.xavier_uniform_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
         nn.init.xavier_uniform_(self.state_head.weight)
         nn.init.zeros_(self.state_head.bias)
 
@@ -120,7 +136,7 @@ class GRUController(LearnerController, nn.Module):
 
     def get_config(self) -> Dict[str, Any]:
         return {
-            "controller_type": "gru",
+            "controller_type": "structured_gru",
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
             "d_model": self.d_model,
@@ -134,6 +150,11 @@ class GRUController(LearnerController, nn.Module):
             "aux_state_weight": self.aux_state_weight,
             "late_timestep_weight": self.late_timestep_weight,
             "recurrent_dropout": self.recurrent_dropout,
+            "mass_loss_weight": self.mass_loss_weight,
+            "residual_loss_weight": self.residual_loss_weight,
+            "residual_force_limit": self.residual_force_limit,
+            "min_mass": self.min_mass,
+            "max_mass": self.max_mass,
         }
 
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
@@ -164,15 +185,52 @@ class GRUController(LearnerController, nn.Module):
     def _refine_features(self, features: torch.Tensor) -> torch.Tensor:
         return features + self.post_mlp(self.post_norm(features))
 
-    def _forward_sequence(self, batch_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        normalized_obs = self._normalize_observations(batch_obs)
-        return self._forward_sequence_from_normalized(normalized_obs)
+    def _analytic_acceleration(self, batch_obs: torch.Tensor) -> torch.Tensor:
+        pos = batch_obs[..., 0:3]
+        vel = batch_obs[..., 6:9]
+        target = batch_obs[..., 12:15]
+        error = target - pos
+        v_target = 1.5 * error
+        acc_desired = 3.0 * (v_target - vel)
+        acc_desired[..., 2] = acc_desired[..., 2] + 9.81
+        return acc_desired
 
-    def _forward_sequence_from_normalized(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self._encode_normalized_inputs(x)
+    def _estimate_mass(self, features: torch.Tensor) -> torch.Tensor:
+        mass_unit = torch.sigmoid(self.mass_head(features))
+        return self.min_mass + (self.max_mass - self.min_mass) * mass_unit
+
+    def _compose_action(
+        self,
+        batch_obs: torch.Tensor,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mass = self._estimate_mass(features)
+        acc_desired = self._analytic_acceleration(batch_obs)
+
+        baseline = torch.zeros(
+            batch_obs.shape[0],
+            batch_obs.shape[1],
+            self.action_dim,
+            device=batch_obs.device,
+            dtype=batch_obs.dtype,
+        )
+        baseline[..., 0:3] = acc_desired * mass
+
+        residual = self.residual_force_limit * torch.tanh(self.residual_head(features))
+        action = torch.clamp(baseline + residual, -FORCE_LIMIT, FORCE_LIMIT)
+        return action, mass, residual
+
+    def _forward_sequence(self, batch_obs: torch.Tensor):
+        normalized_obs = self._normalize_observations(batch_obs)
+        return self._forward_sequence_from_normalized(batch_obs, normalized_obs)
+
+    def _forward_sequence_from_normalized(self, raw_obs: torch.Tensor, normalized_obs: torch.Tensor):
+        x = self._encode_normalized_inputs(normalized_obs)
         x, _ = self.gru(x)
         x = self._refine_features(x)
-        return self.action_head(x), self.state_head(x)
+        pred_act, pred_mass, residual = self._compose_action(raw_obs, x)
+        pred_next = self.state_head(x)
+        return pred_act, pred_next, pred_mass, residual
 
     def _move_batch_to_device(self, batch_obs: torch.Tensor, batch_act: torch.Tensor):
         if batch_obs.device == self.device and batch_act.device == self.device:
@@ -198,17 +256,49 @@ class GRUController(LearnerController, nn.Module):
             loss = loss * time_weights.view(1, -1)
         return loss.mean()
 
+    def _mass_supervision(
+        self,
+        batch_obs: torch.Tensor,
+        batch_act: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        acc_desired = self._analytic_acceleration(batch_obs)
+        acc_z = acc_desired[..., 2]
+        act_z = batch_act[..., 2]
+        valid_mask = (acc_z.abs() > 1.0) & (act_z.abs() < (FORCE_LIMIT - 0.5))
+        pseudo_mass = act_z / torch.clamp(acc_z, min=1e-3)
+        pseudo_mass = torch.clamp(pseudo_mass, min=self.min_mass, max=self.max_mass)
+        return pseudo_mass.unsqueeze(-1), valid_mask.unsqueeze(-1)
+
+    def _masked_mse(self, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask_f = mask.to(dtype=prediction.dtype)
+        denom = mask_f.sum().clamp(min=1.0)
+        diff = ((prediction - target) ** 2) * mask_f
+        return diff.sum() / denom
+
     def _compute_loss(
         self,
-        pred_act: torch.Tensor,
+        batch_obs: torch.Tensor,
         batch_act: torch.Tensor,
+        pred_act: torch.Tensor,
         pred_next: torch.Tensor,
         batch_next: torch.Tensor,
+        pred_mass: torch.Tensor,
+        residual: torch.Tensor,
     ) -> torch.Tensor:
         time_weights = self._build_time_weights(pred_act.shape[1], pred_act.device, pred_act.dtype)
         action_loss = self._sequence_mse(pred_act, batch_act, time_weights=time_weights)
         next_state_loss = self._sequence_mse(pred_next, batch_next, time_weights=time_weights)
-        return action_loss + self.aux_state_weight * next_state_loss
+
+        pseudo_mass, valid_mask = self._mass_supervision(batch_obs, batch_act)
+        mass_loss = self._masked_mse(pred_mass, pseudo_mass, valid_mask)
+
+        residual_penalty = residual.pow(2).mean()
+        return (
+            action_loss
+            + self.aux_state_weight * next_state_loss
+            + self.mass_loss_weight * mass_loss
+            + self.residual_loss_weight * residual_penalty
+        )
 
     def _fit_observation_normalizer(self, loader: DataLoader) -> None:
         total_count = 0
@@ -245,7 +335,8 @@ class GRUController(LearnerController, nn.Module):
         x, hidden_state = self.gru(x, hidden_state)
         self.hidden_state = hidden_state.detach()
         x = self._refine_features(x)
-        return self.action_head(x)
+        pred_act, _, _ = self._compose_action(obs_tensor, x)
+        return pred_act
 
     def forward(self, y: np.ndarray) -> np.ndarray:
         self.eval()
@@ -299,8 +390,8 @@ class GRUController(LearnerController, nn.Module):
                 batch_next = batch_next.to(self.device, non_blocking=True)
                 context = torch.amp.autocast("cuda", enabled=self.use_amp) if self.use_amp else torch.inference_mode()
                 with context:
-                    pred_act, pred_next = self._forward_sequence(batch_obs)
-                    loss = self._compute_loss(pred_act, batch_act, pred_next, batch_next)
+                    pred_act, pred_next, pred_mass, residual = self._forward_sequence(batch_obs)
+                    loss = self._compute_loss(batch_obs, batch_act, pred_act, pred_next, batch_next, pred_mass, residual)
                 total_loss += loss.item()
                 batches_processed += 1
 
@@ -350,14 +441,14 @@ class GRUController(LearnerController, nn.Module):
 
                 self.optimizer_adamw.zero_grad(set_to_none=True)
 
-                normalized_obs = self._normalize_observations(batch_obs)
-                noisy_obs = normalized_obs.clone()
+                noisy_obs = batch_obs.clone()
                 noisy_obs[..., 0:3] = noisy_obs[..., 0:3] + torch.randn_like(noisy_obs[..., 0:3]) * self.noise_std
+                normalized_noisy_obs = self._normalize_observations(noisy_obs)
 
                 context = torch.amp.autocast("cuda", enabled=self.use_amp) if self.use_amp else torch.inference_mode(False)
                 with context:
-                    pred_act, pred_next = self._forward_sequence_from_normalized(noisy_obs)
-                    loss = self._compute_loss(pred_act, batch_act, pred_next, batch_next)
+                    pred_act, pred_next, pred_mass, residual = self._forward_sequence_from_normalized(noisy_obs, normalized_noisy_obs)
+                    loss = self._compute_loss(batch_obs, batch_act, pred_act, pred_next, batch_next, pred_mass, residual)
 
                 if self.grad_scaler:
                     self.grad_scaler.scale(loss).backward()
