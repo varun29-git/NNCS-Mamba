@@ -1,5 +1,5 @@
 """
-Evaluate a trained NNCS-Mamba checkpoint.
+Evaluate a trained NNCS checkpoint.
 
 Usage:
     python evaluate.py --checkpoint runs/full/best_cegis.pt
@@ -11,7 +11,7 @@ import torch
 from pathlib import Path
 
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS, CHECKPOINT_RADIUS
-from mamba_learner import MambaController
+from controller_factory import build_controller_from_config
 from cegis_loop import (
     check_stl_score,
     run_validation_rollouts,
@@ -20,7 +20,7 @@ from cegis_loop import (
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate a trained Mamba controller.")
+    parser = argparse.ArgumentParser(description="Evaluate a trained controller.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
     parser.add_argument("--missions", type=int, default=10, help="Number of evaluation rollouts")
     parser.add_argument("--seq-steps", type=int, default=300)
@@ -34,20 +34,11 @@ def main():
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
-    controller = MambaController(
-        obs_dim=config.get("obs_dim", 15),
-        action_dim=config.get("action_dim", 4),
-        d_model=config.get("d_model", 128),
-        d_state=config.get("d_state", 16),
-        num_layers=config.get("num_layers", 3),
-        lr=config.get("lr", 3e-4),
-        optimizer_name=config.get("optimizer_name", "split_muon"),
-        use_gradient_checkpointing=config.get("use_gradient_checkpointing", True),
-        aux_state_weight=config.get("aux_state_weight", 0.5),
-    )
+    controller = build_controller_from_config(config)
     checkpoint = controller.load_checkpoint(args.checkpoint)
     meta = checkpoint.get("metadata", {})
     print(f"Loaded: {args.checkpoint}")
+    print(f"  Controller: {config.get('controller_type', 'mamba')}")
     print(f"  Phase: {meta.get('phase', '?')}  Epoch/Cycle: {meta.get('epoch', meta.get('cycle', '?'))}")
     print()
 

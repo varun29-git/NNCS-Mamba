@@ -22,6 +22,11 @@ This repository implements a framework for training a neural‑network controlle
 - The hidden state works like a small notebook, remembering which checkpoints have been visited.
 - Takes a 15‑D observation (12‑D state + 3‑D target waypoint) and outputs thrust commands.
 
+## Budget-Optimized Controller (`gru_learner.py`)
+- Adds a cuDNN-backed GRU controller for small GPU budgets such as Tesla T4 sessions.
+- Preserves the same controller interface for training, CEGIS, and step-by-step inference.
+- Uses late-timestep loss weighting to focus more of the training signal on the hardest mission segment: docking.
+
 ## Optimizer
 - Split optimizer: **Muon** for the linear weight matrices and **AdamW** for all other parameters.
 - Mixed‑precision training with PyTorch AMP.
@@ -46,6 +51,7 @@ This repository implements a framework for training a neural‑network controlle
 - A 45‑minute run on a free Tesla T4 GPU showed the model can reach checkpoints A and B reliably.
 - Docking still fails; the model needs more training steps.
 - The new Muon optimizer is expected to double the learning speed.
+- The `t4-sota` profile switches to the GRU controller, batched expert-data generation, and a short CEGIS budget to maximize quality within roughly 3 hours of T4 runtime.
 
 ## How to Run
 ```bash
@@ -58,6 +64,9 @@ pip install -r requirements.txt
 
 # Run the full training and CEGIS loop
 python train.py --epochs 10 --cegis-cycles 5
+
+# Best T4-budget run
+python train.py --phase all --profile t4-sota --outdir runs/t4_sota
 
 # Evaluate a saved checkpoint
 python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot

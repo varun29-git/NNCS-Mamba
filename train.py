@@ -8,6 +8,9 @@ Usage Examples:
 2. Baseline Imitation (The heavy lifting):
    python train.py --phase imitation --num-traj 5000 --batch-size 32 --outdir runs/imitation
 
+2b. Best T4 Budget Run (recommended for 3-hour Colab/T4 sessions):
+   python train.py --phase all --profile t4-sota --outdir runs/t4_sota
+
 3. CEGIS Refinement (Hunting edge cases):
    python train.py --phase cegis --resume runs/imitation/best_imitation.pt --cegis-cycles 20
 
@@ -31,7 +34,8 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
 from drone_env import DronePlant, DroneExpertController, CHECKPOINTS
-from mamba_learner import MambaController
+from drone_env import CHECKPOINT_RADIUS
+from controller_factory import build_controller
 from cegis_loop import falsify_cem
 
 
@@ -55,8 +59,35 @@ PROFILE_OVERRIDES = {
         "cegis_generations": 1,
         "cegis_retrain_epochs": 2,
         "disable_gradient_checkpointing": True,
+        "controller": "mamba",
+        "late_timestep_weight": 1.0,
+        "recurrent_dropout": 0.0,
+    },
+    "t4-sota": {
+        "controller": "gru",
+        "d_model": 192,
+        "d_state": 16,
+        "layers": 2,
+        "lr": 3e-4,
+        "batch_size": 64,
+        "num_traj": 4096,
+        "seq_steps": 300,
+        "epochs": 12,
+        "optimizer": "adamw",
+        "num_workers": 2,
+        "val_split": 0.10,
+        "max_hours": 2.8,
+        "cegis_cycles": 1,
+        "cegis_pop_size": 256,
+        "cegis_generations": 1,
+        "cegis_retrain_epochs": 2,
+        "disable_gradient_checkpointing": True,
+        "late_timestep_weight": 2.5,
+        "recurrent_dropout": 0.1,
     },
 }
+
+DATASET_CACHE_VERSION = "v2"
 
 
 def apply_profile(args, defaults):
@@ -69,7 +100,10 @@ def apply_profile(args, defaults):
 def build_dataset_cache_path(args):
     cache_dir = Path("cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"baseline_dataset_profile-{args.profile}_traj-{args.num_traj}_steps-{args.seq_steps}.pt"
+    return cache_dir / (
+        f"baseline_dataset_{DATASET_CACHE_VERSION}_profile-{args.profile}"
+        f"_traj-{args.num_traj}_steps-{args.seq_steps}.pt"
+    )
 
 
 # =============================================================================
@@ -126,34 +160,92 @@ def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=2):
 # Helper: Generate Baseline Data
 # =============================================================================
 def generate_expert_data(num_traj, seq_steps, dt):
-    print(f"[*] Harvesting {num_traj} expert trajectories...")
-    plant = DronePlant()
-    expert = DroneExpertController()
+    print(f"[*] Harvesting {num_traj} expert trajectories (batched fast path)...")
+    checkpoints = np.asarray(CHECKPOINTS, dtype=np.float32)
     dataset = []
+    chunk_size = min(1024, max(128, num_traj))
+    generated = 0
 
-    for i in range(num_traj):
-        y = plant.reset()
-        # Randomize start-time to simulate partially burned fuel (Low-Mass training)
-        if np.random.rand() > 0.5:
-            plant.time = np.random.uniform(0.0, 60.0) 
-            y = plant.state.copy()
-            
-        expert.reset()
-        expert.set_plant_ref(plant)
+    while generated < num_traj:
+        batch = min(chunk_size, num_traj - generated)
+        states = np.zeros((batch, 12), dtype=np.float32)
+        states[:, 0:3] = np.random.uniform(-10.0, 10.0, size=(batch, 3)).astype(np.float32)
+        states[:, 2] += 12.0
 
-        o_seq = np.empty((seq_steps, 15), dtype=np.float32)
-        a_seq = np.empty((seq_steps, 4), dtype=np.float32)
+        times = np.zeros(batch, dtype=np.float32)
+        low_mass_mask = np.random.rand(batch) > 0.5
+        if np.any(low_mass_mask):
+            times[low_mass_mask] = np.random.uniform(0.0, 60.0, size=int(np.sum(low_mass_mask))).astype(np.float32)
+
+        phase_idx = np.zeros(batch, dtype=np.int64)
+        obs_seq = np.empty((batch, seq_steps, 15), dtype=np.float32)
+        act_seq = np.empty((batch, seq_steps, 4), dtype=np.float32)
+
         for step_idx in range(seq_steps):
-            u = expert.compute_action(y)
-            target = CHECKPOINTS[expert.phase_idx]
-            o_seq[step_idx, :12] = y
-            o_seq[step_idx, 12:] = target
-            a_seq[step_idx] = u
-            y = plant.step(u, dt)
+            targets = checkpoints[phase_idx]
+            pos = states[:, 0:3]
 
-        dataset.append((o_seq, a_seq))
-        if (i + 1) % 500 == 0:
-            print(f"    ...generated {i + 1}/{num_traj}")
+            reached_mask = (phase_idx < 3) & (
+                np.linalg.norm(pos - targets, axis=1) < CHECKPOINT_RADIUS
+            )
+            phase_idx = np.where(reached_mask, phase_idx + 1, phase_idx)
+            targets = checkpoints[phase_idx]
+
+            vel = states[:, 6:9]
+            error = targets - pos
+            v_target = 1.5 * error
+            acc_desired = 3.0 * (v_target - vel)
+            acc_desired[:, 2] += 9.81
+
+            masses = np.maximum(1.0, 2.5 - 0.02 * times).astype(np.float32)
+            force_cmd = np.clip(acc_desired * masses[:, None], -15.0, 15.0).astype(np.float32)
+            action = np.zeros((batch, 4), dtype=np.float32)
+            action[:, 0:3] = force_cmd
+
+            obs_seq[:, step_idx, :12] = states
+            obs_seq[:, step_idx, 12:] = targets
+            act_seq[:, step_idx] = action
+
+            fx, fy, fz, yaw_rate = action[:, 0], action[:, 1], action[:, 2], action[:, 3]
+            ax = fx / masses
+            ay = fy / masses
+            az = fz / masses
+            wind = np.where(np.sin(2.0 * np.pi * times / 5.0) > 0.8, 5.0 / masses, 0.0).astype(np.float32)
+
+            phi = states[:, 3]
+            theta = states[:, 4]
+            vx = states[:, 6]
+            vy = states[:, 7]
+            vz = states[:, 8]
+            p = states[:, 9]
+            q = states[:, 10]
+
+            derivatives = np.stack(
+                [
+                    vx,
+                    vy,
+                    vz,
+                    p,
+                    q,
+                    states[:, 11],
+                    9.81 * theta + wind + ax,
+                    -9.81 * phi + ay,
+                    az - 9.81,
+                    -10.0 * phi - 2.0 * p,
+                    -10.0 * theta - 2.0 * q,
+                    yaw_rate,
+                ],
+                axis=1,
+            ).astype(np.float32)
+            derivatives += np.random.normal(0.0, 0.05, size=(batch, 12)).astype(np.float32)
+
+            states = states + derivatives * dt
+            times = times + dt
+
+        dataset.extend((obs_seq[i], act_seq[i]) for i in range(batch))
+        generated += batch
+        if generated % 500 == 0 or generated == num_traj:
+            print(f"    ...generated {generated}/{num_traj}")
 
     return dataset
 
@@ -331,6 +423,7 @@ def main():
     parser.add_argument("--profile", choices=sorted(PROFILE_OVERRIDES.keys()), default="default")
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
+    parser.add_argument("--controller", choices=["mamba", "gru"], default="mamba")
 
     # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
     parser.add_argument("--d-model", type=int, default=128)
@@ -340,6 +433,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--optimizer", choices=["split_muon", "adamw"], default="split_muon")
     parser.add_argument("--disable-gradient-checkpointing", action="store_true")
+    parser.add_argument("--late-timestep-weight", type=float, default=1.0)
+    parser.add_argument("--recurrent-dropout", type=float, default=0.1)
 
     # Data & Training
     parser.add_argument("--num-traj", type=int, default=5000)
@@ -355,6 +450,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
 
     defaults = {
+        "controller": "mamba",
         "d_model": 128,
         "d_state": 16,
         "layers": 3,
@@ -362,6 +458,8 @@ def main():
         "batch_size": 32,
         "optimizer": "split_muon",
         "disable_gradient_checkpointing": False,
+        "late_timestep_weight": 1.0,
+        "recurrent_dropout": 0.1,
         "num_traj": 5000,
         "seq_steps": 300,
         "epochs": 10,
@@ -375,6 +473,9 @@ def main():
     }
     args = parser.parse_args()
     apply_profile(args, defaults)
+    if args.controller == "gru" and args.optimizer != "adamw":
+        print("[*] Switching optimizer to AdamW for GRU controller.")
+        args.optimizer = "adamw"
     
     global_start_time = time.time()
 
@@ -392,21 +493,33 @@ def main():
         json.dump(vars(args), f, indent=4)
 
     # Initialize Controller
-    print("[*] Initializing Mamba Controller...")
+    print("[*] Initializing controller...")
     # Increase obs_dim to 15 to account for concatenated target coordinates (12D state + 3D target)
-    controller = MambaController(
-        obs_dim=15, action_dim=4,
-        d_model=args.d_model, d_state=args.d_state,
-        num_layers=args.layers, lr=args.lr,
+    controller = build_controller(
+        controller_type=args.controller,
+        obs_dim=15,
+        action_dim=4,
+        d_model=args.d_model,
+        d_state=args.d_state,
+        num_layers=args.layers,
+        lr=args.lr,
         optimizer_name=args.optimizer,
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
+        late_timestep_weight=args.late_timestep_weight,
+        recurrent_dropout=args.recurrent_dropout,
     )
     print(f"    Device: {controller.device}")
-    print(f"    Profile: {args.profile} | Optimizer: {args.optimizer} | Gradient checkpointing: {not args.disable_gradient_checkpointing}")
+    print(
+        f"    Profile: {args.profile} | Controller: {args.controller} | "
+        f"Optimizer: {args.optimizer} | Gradient checkpointing: {not args.disable_gradient_checkpointing}"
+    )
+    print(f"    Late-timestep loss weight: {args.late_timestep_weight:.2f}")
 
-    # NOTE: torch.compile disabled — CUDA Graphs consume ~1.2GB extra VRAM
-    # which causes OOM on A100 MIG 3g.20gb (19.5GB) slices. The sequential
-    # for-loop in selective_scan causes graph breaks anyway, negating benefits.
+    if args.controller == "mamba":
+        # NOTE: torch.compile disabled — CUDA Graphs consume ~1.2GB extra VRAM
+        # which causes OOM on A100 MIG 3g.20gb (19.5GB) slices. The sequential
+        # for-loop in selective_scan causes graph breaks anyway, negating benefits.
+        pass
 
     if args.resume:
         print(f"[*] Resuming from checkpoint: {args.resume}")

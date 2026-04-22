@@ -181,7 +181,7 @@ def falsify_cem(mamba_ctrl, plant, expert_ctrl, num_generations=3, pop_size=2000
     sigma[3:6] = 0.3
     
     vmap_derivatives = torch.vmap(compute_drone_derivatives, in_dims=(0, 0, 0, 0, None), randomness="different")
-    checkpoints_tensor = torch.tensor(CHECKPOINTS, dtype=torch.float32, device=device)
+    checkpoints_tensor = torch.as_tensor(np.asarray(CHECKPOINTS, dtype=np.float32), dtype=torch.float32, device=device)
     
     for gen in range(num_generations):
         # 1. Spawn adversarial states on GPU
