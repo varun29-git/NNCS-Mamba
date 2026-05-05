@@ -144,6 +144,9 @@ def step_gym_env(env, action):
     return obs, reward, bool(done), info
 
 
+# Orchestrates the instantiation of both the quadrotor environment and the MPC expert controller, 
+# seamlessly merging configuration overrides and providing the MPC with a functional blueprint to simulate 
+# future trajectories.
 def make_env_and_mpc(output_dir: str, seed: int, task_config: Dict[str, Any] | None = None):
     make = require_safe_control_gym()
     merged_task_config = dict(SAFE_CONTROL_GYM_TASK_CONFIG)
@@ -165,6 +168,8 @@ def make_env_and_mpc(output_dir: str, seed: int, task_config: Dict[str, Any] | N
     return env, mpc
 
 
+# Generates a configuration dictionary to enforce a specific,
+# deterministic starting state by overriding the environment's randomization boundaries to have zero variance.
 def task_config_for_initial_state(initial_state: np.ndarray) -> Dict[str, Any]:
     state = np.asarray(initial_state, dtype=float).reshape(-1)
     if state.shape[0] != len(STATE_LABELS):
@@ -177,7 +182,9 @@ def task_config_for_initial_state(initial_state: np.ndarray) -> Dict[str, Any]:
         "init_state_randomization_info": randomization,
     }
 
-
+# Safely extracts the 3D target position (x, y, z) by dynamically checking the active environment's 
+# internal state first, falling back to the configuration dictionary if the environment is not yet 
+# initialized.
 def get_goal_position(env=None, task_config: Dict[str, Any] | None = None) -> np.ndarray:
     if env is not None and hasattr(env, "X_GOAL"):
         goal = np.asarray(env.X_GOAL).reshape(-1)
@@ -188,7 +195,8 @@ def get_goal_position(env=None, task_config: Dict[str, Any] | None = None) -> np
     cfg = task_config or SAFE_CONTROL_GYM_TASK_CONFIG
     return np.asarray(cfg["task_info"]["stabilization_goal"], dtype=np.float32)
 
-
+# Provides helper functions to extract specific physical 
+# components (position, velocity, or Euler angles) from a state array, utilizing the Ellipsis (...) operator to safely process both single observations and multi-dimensional batches.
 def state_position(obs: np.ndarray) -> np.ndarray:
     return np.asarray(obs)[..., POSITION_IDX]
 
