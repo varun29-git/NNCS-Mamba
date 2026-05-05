@@ -23,6 +23,8 @@ import json
 import numpy as np
 import torch
 import time
+from functools import partial
+from importlib.util import find_spec
 from pathlib import Path
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
@@ -37,6 +39,57 @@ from drone_env import DronePlant, DroneExpertController, CHECKPOINTS
 from drone_env import CHECKPOINT_RADIUS, FORCE_LIMIT
 from controller_factory import build_controller
 from cegis_loop import falsify_cem
+
+
+SAFE_CONTROL_GYM_SOURCE = "https://github.com/learnsyslab/safe-control-gym"
+SAFE_CONTROL_GYM_TASK_CONFIG = {
+    "seed": 1337,
+    "ctrl_freq": 50,
+    "pyb_freq": 1000,
+    "gui": False,
+    "physics": "pyb",
+    "quad_type": 3,
+    "init_state_randomization_info": {
+        "init_x": {"distrib": "uniform", "low": -1, "high": 1},
+        "init_x_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+        "init_y": {"distrib": "uniform", "low": -1, "high": 1},
+        "init_y_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+        "init_z": {"distrib": "uniform", "low": 0.5, "high": 1.5},
+        "init_z_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+        "init_phi": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+        "init_theta": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+        "init_psi": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+        "init_p": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+        "init_q": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+        "init_r": {"distrib": "uniform", "low": -0.1, "high": 0.1},
+    },
+    "randomized_init": True,
+    "randomized_inertial_prop": False,
+    "task": "stabilization",
+    "task_info": {
+        "stabilization_goal": [0, 0, 1],
+        "stabilization_goal_tolerance": 0.0,
+        "proj_point": [0, 0, 0.5],
+        "proj_normal": [0, 1, 1],
+    },
+    "episode_len_sec": 6,
+    "cost": "quadratic",
+    "rew_state_weight": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+    "rew_act_weight": [0.1],
+    "done_on_out_of_bound": True,
+}
+SAFE_CONTROL_GYM_MPC_CONFIG = {
+    "horizon": 20,
+    "r_mpc": [0.1, 0.1, 0.1, 0.1],
+    "q_mpc": [5.0, 0.1, 5.0, 0.1, 5.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+    "prior_info": {
+        "prior_prop": None,
+        "randomize_prior_prop": False,
+        "prior_prop_rand_info": None,
+    },
+    "warmstart": True,
+    "solver": "ipopt",
+}
 
 
 PROFILE_OVERRIDES = {
@@ -123,9 +176,37 @@ def build_dataset_cache_path(args):
     cache_dir = Path("cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / (
-        f"baseline_dataset_{DATASET_CACHE_VERSION}_profile-{args.profile}"
+        f"baseline_dataset_{DATASET_CACHE_VERSION}_backend-{args.plant_backend}_profile-{args.profile}"
         f"_traj-{args.num_traj}_steps-{args.seq_steps}.pt"
     )
+
+
+def require_safe_control_gym():
+    if find_spec("safe_control_gym") is None:
+        raise RuntimeError(
+            "safe_control_gym is required for --plant-backend safe-control-gym. "
+            "Install the upstream benchmark with `python -m pip install -e .` "
+            f"from {SAFE_CONTROL_GYM_SOURCE}."
+        )
+    from safe_control_gym.utils.registration import make
+
+    return make
+
+
+def reset_gym_env(env):
+    reset_result = env.reset()
+    if isinstance(reset_result, tuple) and len(reset_result) == 2:
+        return reset_result
+    return reset_result, {}
+
+
+def step_gym_env(env, action):
+    step_result = env.step(action)
+    if len(step_result) == 5:
+        obs, reward, terminated, truncated, info = step_result
+        return obs, reward, bool(terminated or truncated), info
+    obs, reward, done, info = step_result
+    return obs, reward, bool(done), info
 
 
 # =============================================================================
@@ -272,6 +353,61 @@ def generate_expert_data(num_traj, seq_steps, dt):
     return dataset
 
 
+def generate_safe_control_gym_expert_data(num_traj, seq_steps, args):
+    print(f"[*] Harvesting {num_traj} Safe-Control-Gym MPC trajectories...")
+    make = require_safe_control_gym()
+    task_config = dict(SAFE_CONTROL_GYM_TASK_CONFIG)
+    task_config["seed"] = args.seed
+    env_func = partial(make, "quadrotor", output_dir=str(Path(args.outdir) / "safe_control_gym"), **task_config)
+    env = env_func()
+    mpc = make(
+        "mpc",
+        env_func,
+        training=False,
+        output_dir=str(Path(args.outdir) / "safe_control_gym"),
+        seed=args.seed,
+        **SAFE_CONTROL_GYM_MPC_CONFIG,
+    )
+    mpc.reset()
+
+    dataset = []
+    try:
+        for traj_idx in range(num_traj):
+            obs, info = reset_gym_env(env)
+            mpc.reset_before_run(obs=obs, info=info, env=env)
+
+            obs_seq = np.empty((seq_steps, 12), dtype=np.float32)
+            act_seq = np.empty((seq_steps, 4), dtype=np.float32)
+
+            for step_idx in range(seq_steps):
+                action = np.asarray(mpc.select_action(obs, info), dtype=np.float32)
+                obs_seq[step_idx] = np.asarray(obs, dtype=np.float32)
+                act_seq[step_idx] = action
+
+                obs, _, done, info = step_gym_env(env, action)
+                if done and step_idx < seq_steps - 1:
+                    obs_seq[step_idx + 1:] = np.asarray(obs, dtype=np.float32)
+                    act_seq[step_idx + 1:] = 0.0
+                    break
+
+            dataset.append((obs_seq, act_seq))
+            if (traj_idx + 1) % 100 == 0 or traj_idx + 1 == num_traj:
+                print(f"    ...generated {traj_idx + 1}/{num_traj}")
+    finally:
+        mpc.close()
+        env.close()
+
+    return dataset
+
+
+def generate_dataset(args, num_traj=None, seq_steps=None):
+    num_traj = args.num_traj if num_traj is None else num_traj
+    seq_steps = args.seq_steps if seq_steps is None else seq_steps
+    if args.plant_backend == "safe-control-gym":
+        return generate_safe_control_gym_expert_data(num_traj, seq_steps, args)
+    return generate_expert_data(num_traj, seq_steps, 0.1)
+
+
 def fix_and_merge(failures, expert, plant, buffer, seq_steps, dt):
     """Takes failure states, has the expert fix them, and adds to buffer."""
     for state in failures:
@@ -302,7 +438,7 @@ def run_smoke(controller, args, outdir):
     """Quick sanity check — kernels compile, backward pass works."""
     print("\n=== PHASE: SMOKE TEST ===")
     print("Testing kernel compilation and backward pass...")
-    dataset = generate_expert_data(10, 100, 0.1)
+    dataset = generate_dataset(args, num_traj=10, seq_steps=100)
     train_loader, val_loader = create_cpu_dataloaders(dataset, batch_size=2)
     metrics = controller.update(train_loader, val_loader, epochs=2, fit_normalizer=True)
     print(f"Smoke Test Complete. Train Loss: {metrics['train_loss']:.4f} | Val Loss: {metrics['val_loss']:.4f}")
@@ -354,6 +490,13 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
 
 def run_cegis(controller, args, outdir, dataset, global_start_time):
     """CEGIS refinement — falsify, fix, retrain."""
+    if args.plant_backend != "prototype":
+        raise NotImplementedError(
+            "CEGIS is currently implemented only for the prototype plant. "
+            "The Safe-Control-Gym path now uses the trusted quadrotor plant and MPC expert "
+            "for imitation data; Safe-Control-Gym falsification/STL integration is the next migration step."
+        )
+
     print("\n=== PHASE: CEGIS REFINEMENT ===")
 
     plant = DronePlant()
@@ -449,6 +592,7 @@ def main():
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
     parser.add_argument("--controller", choices=["mamba", "gru", "structured_gru"], default="mamba")
+    parser.add_argument("--plant-backend", choices=["safe-control-gym", "prototype"], default="safe-control-gym")
 
     # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
     parser.add_argument("--d-model", type=int, default=128)
@@ -517,13 +661,15 @@ def main():
     with open(outdir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=4)
 
+    obs_dim = 12 if args.plant_backend == "safe-control-gym" else 15
+    action_dim = 4
+
     # Initialize Controller
     print("[*] Initializing controller...")
-    # Increase obs_dim to 15 to account for concatenated target coordinates (12D state + 3D target)
     controller = build_controller(
         controller_type=args.controller,
-        obs_dim=15,
-        action_dim=4,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
         d_model=args.d_model,
         d_state=args.d_state,
         num_layers=args.layers,
@@ -536,7 +682,8 @@ def main():
     print(f"    Device: {controller.device}")
     print(
         f"    Profile: {args.profile} | Controller: {args.controller} | "
-        f"Optimizer: {args.optimizer} | Gradient checkpointing: {not args.disable_gradient_checkpointing}"
+        f"Plant backend: {args.plant_backend} | Optimizer: {args.optimizer} | "
+        f"Gradient checkpointing: {not args.disable_gradient_checkpointing}"
     )
     print(f"    Late-timestep loss weight: {args.late_timestep_weight:.2f}")
 
@@ -566,9 +713,9 @@ def main():
             cached_data = torch.load(cache_path, weights_only=False)
             
             sample_obs = cached_data[0][0]
-            if sample_obs.shape[-1] != 15 or sample_obs.shape[0] != args.seq_steps:
+            if sample_obs.shape[-1] != obs_dim or sample_obs.shape[0] != args.seq_steps:
                 print(
-                    f"[!] Cache shape mismatch ({tuple(sample_obs.shape)} != ({args.seq_steps}, 15)). "
+                    f"[!] Cache shape mismatch ({tuple(sample_obs.shape)} != ({args.seq_steps}, {obs_dim})). "
                     "Invalidating cache..."
                 )
                 raise ValueError("Old cache format")
@@ -579,11 +726,11 @@ def main():
             print(f"    Loaded {len(dataset)} trajectories.")
         except Exception as e:
             print(f"    [!] Failed to load cache: {e}. Re-harvesting...")
-            raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+            raw_data = generate_dataset(args)
             dataset.extend(raw_data)
             torch.save(list(dataset), cache_path)
     elif args.num_traj > 0:
-        raw_data = generate_expert_data(args.num_traj, args.seq_steps, 0.1)
+        raw_data = generate_dataset(args)
         dataset.extend(raw_data)
         torch.save(list(dataset), cache_path)
         print(f"[*] Baseline dataset cached to {cache_path}")

@@ -4,9 +4,9 @@ This repository implements a framework for training a neural‑network controlle
 
 ## Research Hardening Status
 
-This repository currently contains an exploratory prototype. The custom plant and PD-style expert in `drone_env.py` are useful for developing the training pipeline, but they are not yet validated against a trusted quadrotor model from literature, MATLAB/MathWorks, or an established benchmark. Final research claims should use a validated plant and an existing MPC expert implementation, such as a pinned Safe-Control-Gym quadrotor/MPC setup, before comparing Mamba against baselines.
+This repository currently contains an exploratory prototype. The custom plant and PD-style expert in `drone_env.py` are useful for developing the training pipeline, but they are not yet validated against a trusted quadrotor model from literature, MATLAB/MathWorks, or an established benchmark.
 
-The first trusted-backend boundary lives in `research_backends/`. It currently checks whether Safe-Control-Gym is available and records the intended provenance; it does not yet replace the prototype plant or controller.
+The research path in `train.py` now directly uses Safe-Control-Gym for a trusted quadrotor plant and MPC expert when run with `--plant-backend safe-control-gym`. Safe-Control-Gym must be installed separately from its upstream repository: https://github.com/learnsyslab/safe-control-gym
 
 ## Overview
 - A simulated drone with a 12‑D state (position, velocity, tilt, angular rates).
@@ -68,11 +68,17 @@ cd NNCS-Mamba
 # Install dependencies (requires a CUDA‑enabled machine)
 pip install -r requirements.txt
 
-# Run the full training and CEGIS loop
-python train.py --epochs 10 --cegis-cycles 5
+# Research-grade plant/MPC dependency
+git clone https://github.com/learnsyslab/safe-control-gym.git
+cd safe-control-gym
+python -m pip install -e .
+cd ../NNCS-Mamba
 
-# Best T4-budget run
-python train.py --phase all --profile t4-sota --outdir runs/t4_sota
+# Train on Safe-Control-Gym quadrotor MPC demonstrations
+python train.py --phase imitation --plant-backend safe-control-gym --epochs 10
+
+# Prototype-only legacy pipeline
+python train.py --phase all --plant-backend prototype --profile t4-sota --outdir runs/t4_sota
 
 # Evaluate a saved checkpoint
 python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot
