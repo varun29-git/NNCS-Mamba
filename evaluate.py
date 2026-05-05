@@ -24,9 +24,46 @@ from safe_control_gym_config import (
 from stl_monitor import STLSpec, evaluate_stabilization_stl
 
 
+def task_config_for_profile(profile: str):
+    if profile == "wide-init":
+        return {
+            "init_state_randomization_info": {
+                "init_x": {"distrib": "uniform", "low": -1.5, "high": 1.5},
+                "init_x_dot": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+                "init_y": {"distrib": "uniform", "low": -1.5, "high": 1.5},
+                "init_y_dot": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+                "init_z": {"distrib": "uniform", "low": 0.35, "high": 1.8},
+                "init_z_dot": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+                "init_phi": {"distrib": "uniform", "low": -0.35, "high": 0.35},
+                "init_theta": {"distrib": "uniform", "low": -0.35, "high": 0.35},
+                "init_psi": {"distrib": "uniform", "low": -0.35, "high": 0.35},
+                "init_p": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+                "init_q": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+                "init_r": {"distrib": "uniform", "low": -0.2, "high": 0.2},
+            }
+        }
+    return {}
+
+
+def stl_spec_for_profile(profile: str, goal_position: np.ndarray):
+    if profile == "constraint-tight":
+        return STLSpec(
+            goal_position=goal_position,
+            position_tolerance=0.18,
+            settle_position_tolerance=0.25,
+            settle_speed_tolerance=0.18,
+            x_bound=1.75,
+            y_bound=1.75,
+            z_min=0.25,
+            z_max=1.75,
+            max_abs_angle=0.5,
+        )
+    return STLSpec(goal_position=goal_position)
+
+
 def evaluate_safe_control_gym(controller, args):
     output_dir = str(Path(args.checkpoint).parent / "safe_control_gym_eval")
-    env, mpc = make_env_and_mpc(output_dir, args.seed)
+    env, mpc = make_env_and_mpc(output_dir, args.seed, task_config=task_config_for_profile(args.robustness_profile))
     action_low, action_high = action_bounds(env)
 
     episode_returns = []
@@ -88,7 +125,7 @@ def evaluate_safe_control_gym(controller, args):
                 stl = evaluate_stabilization_stl(
                     np.stack(states),
                     learner_stack,
-                    STLSpec(goal_position=goal_pos),
+                    stl_spec_for_profile(args.robustness_profile, goal_pos),
                     action_low,
                     action_high,
                 )
@@ -114,11 +151,12 @@ def evaluate_safe_control_gym(controller, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a trained controller.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to .pt checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt checkpoint")
     parser.add_argument("--missions", type=int, default=10, help="Number of evaluation rollouts")
     parser.add_argument("--seq-steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--expert-only", action="store_true", help="Evaluate Safe-Control-Gym MPC without a learned checkpoint")
+    parser.add_argument("--robustness-profile", choices=["nominal", "wide-init", "constraint-tight"], default="nominal")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -128,6 +166,8 @@ def main():
     config = {"controller_type": "safe-control-gym-mpc"}
     meta = {"phase": "expert"}
     if not args.expert_only:
+        if args.checkpoint is None:
+            raise ValueError("--checkpoint is required unless --expert-only is set")
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         config = checkpoint.get("config", {})
         controller = build_controller_from_config(config)
@@ -137,6 +177,7 @@ def main():
     print(f"Loaded: {'Safe-Control-Gym MPC expert' if args.expert_only else args.checkpoint}")
     print(f"  Controller: {config.get('controller_type', 'mamba')}")
     print(f"  Plant backend: safe-control-gym")
+    print(f"  Robustness profile: {args.robustness_profile}")
     print(f"  Phase: {meta.get('phase', '?')}  Epoch/Cycle: {meta.get('epoch', meta.get('cycle', '?'))}")
     print()
 
