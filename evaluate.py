@@ -62,7 +62,8 @@ def stl_spec_for_profile(profile: str, goal_position: np.ndarray):
 
 
 def evaluate_safe_control_gym(controller, args):
-    output_dir = str(Path(args.checkpoint).parent / "safe_control_gym_eval")
+    checkpoint_parent = Path(args.checkpoint).parent if args.checkpoint else Path("runs/expert_eval")
+    output_dir = str(checkpoint_parent / "safe_control_gym_eval")
     env, mpc = make_env_and_mpc(output_dir, args.seed, task_config=task_config_for_profile(args.robustness_profile))
     action_low, action_high = action_bounds(env)
 
