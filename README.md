@@ -10,6 +10,7 @@ The plant and MPC expert are provided directly by Safe-Control-Gym: https://gith
 - Safe-Control-Gym provides the physics-based 3D quadrotor environment.
 - Safe-Control-Gym MPC generates expert state/action demonstrations.
 - Neural controllers learn to imitate the MPC from trajectory data.
+- `RESEARCH.md` records the state/action semantics, MPC settings, STL specification, and experiment commands.
 
 ## Neural Architecture (Mamba) (`mamba_learner.py`)
 - Uses a Mamba block (a selective state‑space model) that maintains a hidden state across time steps.
@@ -17,6 +18,9 @@ The plant and MPC expert are provided directly by Safe-Control-Gym: https://gith
 
 ## Baseline Controller (`gru_learner.py`)
 - Adds a cuDNN-backed GRU baseline for comparison under the same data and evaluation setup.
+
+## Memoryless Baseline (`mlp_learner.py`)
+- Adds an MLP baseline so Mamba is compared against both memoryless and recurrent neural controllers.
 
 ## Optimizer
 - Split optimizer: **Muon** for the linear weight matrices and **AdamW** for all other parameters.
@@ -27,14 +31,15 @@ The plant and MPC expert are provided directly by Safe-Control-Gym: https://gith
 1. **Smoke test** – quick run to verify the model compiles.
 2. **Expert data generation** – collect trajectories from Safe-Control-Gym MPC.
 3. **Imitation learning** – train Mamba or GRU on expert trajectories.
+4. **CEGIS refinement** – identify negative-STL learner rollouts, label those initial states with MPC, and retrain.
 
 ## Evaluation (`evaluate.py`)
 - Loads a saved checkpoint and runs a number of rollouts.
-- Reports return, final position error, action MSE versus MPC, and constraint violations.
+- Reports return, final position error, action MSE/MAE versus MPC, constraint violations, STL robustness, STL satisfaction rate, and runtime.
 
 ## Current Status
 - The project has been simplified to one defensible environment/controller source.
-- Counterexample-guided retraining and formal STL robustness should be reintroduced only against Safe-Control-Gym trajectories.
+- Counterexample-guided retraining and formal STL robustness are implemented against Safe-Control-Gym trajectories.
 
 ## How to Run
 ```bash
@@ -57,8 +62,17 @@ python train.py --phase imitation --epochs 10
 # Evaluate on the same Safe-Control-Gym physics plant
 python evaluate.py --checkpoint runs/experiment/best_imitation.pt
 
-# GRU baseline
+# Baselines
+python train.py --phase imitation --controller mlp --profile mlp-baseline --outdir runs/mlp_baseline
 python train.py --phase imitation --controller gru --profile t4-sota --outdir runs/gru_baseline
+
+# CEGIS ablation
+python train.py --phase all --resume runs/experiment/best_imitation.pt --outdir runs/cegis
+
+# Research sweeps
+python research_experiments.py compare
+python research_experiments.py sample-efficiency
+python research_experiments.py robustness --checkpoint runs/experiment/best_imitation.pt
 ```
 
 Feel free to open issues or pull requests as the project evolves.
