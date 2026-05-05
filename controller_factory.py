@@ -1,6 +1,7 @@
 from typing import Any, Dict
 
 from gru_learner import GRUController
+from mlp_learner import MLPController
 from mamba_learner import MambaController
 
 
@@ -37,6 +38,21 @@ def build_controller(
         )
     if controller_key == "gru":
         return GRUController(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            d_model=d_model,
+            d_state=d_state,
+            num_layers=num_layers,
+            lr=lr,
+            optimizer_name="adamw",
+            use_gradient_checkpointing=False,
+            aux_state_weight=aux_state_weight,
+            late_timestep_weight=late_timestep_weight,
+            recurrent_dropout=recurrent_dropout,
+            action_clip=action_clip,
+        )
+    if controller_key == "mlp":
+        return MLPController(
             obs_dim=obs_dim,
             action_dim=action_dim,
             d_model=d_model,
