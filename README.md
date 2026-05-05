@@ -1,37 +1,22 @@
 # NNCS-Mamba (under development)
 
-This repository implements a framework for training a neural‑network controller for a 12‑dimensional drone using Counter‑Example Guided Inductive Synthesis (CEGIS). The code is still being written and is not yet complete.
+This repository trains sequence controllers to imitate an MPC expert on the Safe-Control-Gym 3D quadrotor benchmark.
 
 ## Research Hardening Status
 
-This repository currently contains an exploratory prototype. The custom plant and PD-style expert in `drone_env.py` are useful for developing the training pipeline, but they are not yet validated against a trusted quadrotor model from literature, MATLAB/MathWorks, or an established benchmark.
-
-The research path in `train.py` now directly uses Safe-Control-Gym for a trusted quadrotor plant and MPC expert when run with `--plant-backend safe-control-gym`. Safe-Control-Gym must be installed separately from its upstream repository: https://github.com/learnsyslab/safe-control-gym
+The plant and MPC expert are provided directly by Safe-Control-Gym: https://github.com/learnsyslab/safe-control-gym
 
 ## Overview
-- A simulated drone with a 12‑D state (position, velocity, tilt, angular rates).
-- The mission consists of three steps: reach checkpoint A, then checkpoint B, then dock at the origin.
-- Hidden disturbances: a leaky fuel tank (mass decreases) and invisible wind gusts.
-
-## Simulation Environment (`drone_env.py`)
-- Provides the physics of the drone, including fuel loss and wind.
-- Defines three checkpoints and a radius (`CHECKPOINT_RADIUS = 1.5`) for successful visits.
-- Keeps a phase counter that tells the controller which checkpoint is next.
-
-## Expert (Teacher) Controller (`drone_env.py`)
-- A physics‑based controller that knows the exact mass and wind.
-- Generates perfect trajectories that the neural controller can imitate.
-- Used to create corrective examples during the CEGIS refinement phase.
+- Safe-Control-Gym provides the physics-based 3D quadrotor environment.
+- Safe-Control-Gym MPC generates expert state/action demonstrations.
+- Neural controllers learn to imitate the MPC from trajectory data.
 
 ## Neural Architecture (Mamba) (`mamba_learner.py`)
 - Uses a Mamba block (a selective state‑space model) that maintains a hidden state across time steps.
-- The hidden state works like a small notebook, remembering which checkpoints have been visited.
-- Takes a 15‑D observation (12‑D state + 3‑D target waypoint) and outputs thrust commands.
+- Takes the 12‑D Safe-Control-Gym quadrotor observation and outputs 4D control actions.
 
-## Budget-Optimized Controller (`gru_learner.py`)
-- Adds a cuDNN-backed GRU controller for small GPU budgets such as Tesla T4 sessions.
-- Preserves the same controller interface for training, CEGIS, and step-by-step inference.
-- Uses late-timestep loss weighting to focus more of the training signal on the hardest mission segment: docking.
+## Baseline Controller (`gru_learner.py`)
+- Adds a cuDNN-backed GRU baseline for comparison under the same data and evaluation setup.
 
 ## Optimizer
 - Split optimizer: **Muon** for the linear weight matrices and **AdamW** for all other parameters.
@@ -40,24 +25,16 @@ The research path in `train.py` now directly uses Safe-Control-Gym for a trusted
 
 ## Training Pipeline (`train.py`)
 1. **Smoke test** – quick run to verify the model compiles.
-2. **Imitation learning** – train on expert trajectories (default 5,000) for a configurable number of epochs.
-3. **CEGIS refinement** – generate failure states with a Cross‑Entropy Method (CEM), let the expert correct them, and retrain on the combined data.
-
-## CEGIS Loop (`cegis_loop.py`)
-- Generates a population of 2,000 candidate states and evaluates them with a Signal Temporal Logic (STL) score.
-- Failures are fixed by the expert (`fix_and_merge`) and added to the training buffer.
-- Logs the number of failures, safety coverage, and loss after each cycle.
+2. **Expert data generation** – collect trajectories from Safe-Control-Gym MPC.
+3. **Imitation learning** – train Mamba or GRU on expert trajectories.
 
 ## Evaluation (`evaluate.py`)
 - Loads a saved checkpoint and runs a number of rollouts.
-- Reports the success rate for visiting checkpoints in order and the average number of checkpoints reached.
-- Can optionally plot a single trajectory with checkpoint markers.
+- Reports return, final position error, action MSE versus MPC, and constraint violations.
 
 ## Current Status
-- A 45‑minute run on a free Tesla T4 GPU showed the model can reach checkpoints A and B reliably.
-- Docking still fails; the model needs more training steps.
-- The new Muon optimizer is expected to double the learning speed.
-- The `t4-sota` profile switches to the GRU controller, batched expert-data generation, and a short CEGIS budget to maximize quality within roughly 3 hours of T4 runtime.
+- The project has been simplified to one defensible environment/controller source.
+- Counterexample-guided retraining and formal STL robustness should be reintroduced only against Safe-Control-Gym trajectories.
 
 ## How to Run
 ```bash
@@ -75,16 +52,13 @@ python -m pip install -e .
 cd ../NNCS-Mamba
 
 # Train on Safe-Control-Gym quadrotor MPC demonstrations
-python train.py --phase imitation --plant-backend safe-control-gym --epochs 10
+python train.py --phase imitation --epochs 10
 
 # Evaluate on the same Safe-Control-Gym physics plant
-python evaluate.py --checkpoint runs/experiment/best_imitation.pt --plant-backend safe-control-gym
+python evaluate.py --checkpoint runs/experiment/best_imitation.pt
 
-# Prototype-only legacy pipeline
-python train.py --phase all --plant-backend prototype --profile t4-sota --outdir runs/t4_sota
-
-# Evaluate a saved checkpoint
-python evaluate.py --checkpoint runs/full/best_cegis.pt --missions 20 --plot
+# GRU baseline
+python train.py --phase imitation --controller gru --profile t4-sota --outdir runs/gru_baseline
 ```
 
 Feel free to open issues or pull requests as the project evolves.
