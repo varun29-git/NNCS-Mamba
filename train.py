@@ -319,7 +319,7 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
 
 
 def find_counterexample_initial_states(controller, args):
-    env, _ = make_env_and_mpc(str(Path(args.outdir) / "safe_control_gym_falsify"), args.seed)
+    env, mpc = make_env_and_mpc(str(Path(args.outdir) / "safe_control_gym_falsify"), args.seed)
     action_low, action_high = action_bounds(env)
     failures = []
     robustness_values = []
@@ -349,6 +349,7 @@ def find_counterexample_initial_states(controller, args):
             if stl["stl_robustness"] < 0.0:
                 failures.append((stl["stl_robustness"], initial_obs))
     finally:
+        mpc.close()
         env.close()
 
     failures.sort(key=lambda item: item[0])
