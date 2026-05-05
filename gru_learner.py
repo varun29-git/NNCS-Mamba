@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
-from drone_env import FORCE_LIMIT
 
 
 class GRUController(LearnerController, nn.Module):
@@ -32,7 +31,7 @@ class GRUController(LearnerController, nn.Module):
         aux_state_weight: float = 0.5,
         late_timestep_weight: float = 1.0,
         recurrent_dropout: float = 0.1,
-        action_clip: Optional[float] = FORCE_LIMIT,
+        action_clip: Optional[float] = None,
     ):
         nn.Module.__init__(self)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -77,6 +77,9 @@ cd ../NNCS-Mamba
 # Train on Safe-Control-Gym quadrotor MPC demonstrations
 python train.py --phase imitation --plant-backend safe-control-gym --epochs 10
 
+# Evaluate on the same Safe-Control-Gym physics plant
+python evaluate.py --checkpoint runs/experiment/best_imitation.pt --plant-backend safe-control-gym
+
 # Prototype-only legacy pipeline
 python train.py --phase all --plant-backend prototype --profile t4-sota --outdir runs/t4_sota
 

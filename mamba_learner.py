@@ -7,7 +7,6 @@ import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 
 from abstract_env import LearnerController
-from drone_env import FORCE_LIMIT
 from mamba_block import MambaBlock, MambaCache
 from muon_optimizer import Muon
 
@@ -28,7 +27,7 @@ class MambaController(LearnerController, nn.Module):
         use_gradient_checkpointing: bool = True,
         aux_state_weight: float = 0.5,
         late_timestep_weight: float = 1.0,
-        action_clip: Optional[float] = FORCE_LIMIT,
+        action_clip: Optional[float] = None,
     ):
         nn.Module.__init__(self)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
