@@ -44,5 +44,3 @@ class LearnerController(ABC):
             Any: Training metrics (e.g., loss values).
         """
         pass
-
-# ------------------------------------------------------------------------------
