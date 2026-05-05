@@ -35,9 +35,14 @@ from safe_control_gym_config import (
     SAFE_CONTROL_GYM_VERSION,
     make_env_and_mpc,
     reset_gym_env,
+    task_config_for_initial_state,
+    action_bounds,
+    clip_to_env_action_space,
+    get_goal_position,
     step_gym_env,
     write_benchmark_manifest,
 )
+from stl_monitor import STLSpec, evaluate_stabilization_stl
 
 
 PROFILE_OVERRIDES = {
@@ -207,6 +212,36 @@ def generate_safe_control_gym_expert_data(num_traj, seq_steps, args):
     return dataset
 
 
+def generate_safe_control_gym_expert_data_from_states(initial_states, seq_steps, args):
+    dataset = []
+    for idx, initial_state in enumerate(initial_states):
+        fixed_config = task_config_for_initial_state(initial_state)
+        env, mpc = make_env_and_mpc(
+            str(Path(args.outdir) / "safe_control_gym_cegis"),
+            args.seed + idx,
+            task_config=fixed_config,
+        )
+        try:
+            obs, info = reset_gym_env(env)
+            mpc.reset_before_run(obs=obs, info=info, env=env)
+            obs_seq = np.empty((seq_steps, 12), dtype=np.float32)
+            act_seq = np.empty((seq_steps, 4), dtype=np.float32)
+            for step_idx in range(seq_steps):
+                action = np.asarray(mpc.select_action(obs, info), dtype=np.float32)
+                obs_seq[step_idx] = np.asarray(obs, dtype=np.float32)
+                act_seq[step_idx] = action
+                obs, _, done, info = step_gym_env(env, action)
+                if done and step_idx < seq_steps - 1:
+                    obs_seq[step_idx + 1:] = np.asarray(obs, dtype=np.float32)
+                    act_seq[step_idx + 1:] = 0.0
+                    break
+            dataset.append((obs_seq, act_seq))
+        finally:
+            mpc.close()
+            env.close()
+    return dataset
+
+
 def generate_dataset(args, num_traj=None, seq_steps=None):
     num_traj = args.num_traj if num_traj is None else num_traj
     seq_steps = args.seq_steps if seq_steps is None else seq_steps
@@ -283,12 +318,106 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
     return outdir / "best_imitation.pt"
 
 
+def find_counterexample_initial_states(controller, args):
+    env, _ = make_env_and_mpc(str(Path(args.outdir) / "safe_control_gym_falsify"), args.seed)
+    action_low, action_high = action_bounds(env)
+    failures = []
+    robustness_values = []
+    try:
+        for _ in range(args.cegis_pop_size):
+            obs, info = reset_gym_env(env)
+            initial_obs = np.asarray(obs, dtype=np.float32).copy()
+            controller.reset()
+            states = [initial_obs]
+            actions = []
+            for _ in range(args.seq_steps):
+                action = np.asarray(controller.forward(np.asarray(obs, dtype=np.float32)), dtype=np.float32)
+                action = clip_to_env_action_space(env, action)
+                actions.append(action)
+                obs, _, done, info = step_gym_env(env, action)
+                states.append(np.asarray(obs, dtype=np.float32))
+                if done:
+                    break
+            stl = evaluate_stabilization_stl(
+                np.stack(states),
+                np.stack(actions) if actions else None,
+                STLSpec(goal_position=get_goal_position(env)),
+                action_low,
+                action_high,
+            )
+            robustness_values.append(stl["stl_robustness"])
+            if stl["stl_robustness"] < 0.0:
+                failures.append((stl["stl_robustness"], initial_obs))
+    finally:
+        env.close()
+
+    failures.sort(key=lambda item: item[0])
+    selected = [state for _, state in failures[: args.cegis_max_failures]]
+    return selected, robustness_values
+
+
+def run_cegis(controller, args, outdir, dataset, global_start_time):
+    print("\n=== PHASE: CEGIS REFINEMENT ===")
+    recovery_buffer = []
+    csv_log = open(outdir / "cegis_log.csv", "w")
+    csv_log.write("iteration,failures,mean_stl_robustness,min_stl_robustness,train_loss,val_loss\n")
+    try:
+        for iteration in range(1, args.cegis_iterations + 1):
+            if time.time() - global_start_time > args.max_hours * 3600:
+                print(f"[!] Time limit reached ({args.max_hours:.2f} hours). Exiting CEGIS.")
+                break
+            failures, robustness_values = find_counterexample_initial_states(controller, args)
+            mean_robustness = float(np.mean(robustness_values)) if robustness_values else float("nan")
+            min_robustness = float(np.min(robustness_values)) if robustness_values else float("nan")
+            print(
+                f"CEGIS iteration {iteration:02d}: failures={len(failures)} "
+                f"mean_STL={mean_robustness:.3f} min_STL={min_robustness:.3f}"
+            )
+            if not failures:
+                controller.save_checkpoint(
+                    str(outdir / "best_cegis.pt"),
+                    **checkpoint_metadata(args, phase="cegis", cegis_iteration=iteration),
+                )
+                break
+
+            recovery_buffer.extend(generate_safe_control_gym_expert_data_from_states(failures, args.seq_steps, args))
+            mixed_dataset = list(dataset) + recovery_buffer
+            train_loader, val_loader = create_cpu_dataloaders(
+                mixed_dataset,
+                args.batch_size,
+                val_split=args.val_split,
+                num_workers=args.num_workers,
+            )
+            metrics = controller.update(
+                train_loader,
+                val_loader,
+                epochs=args.cegis_retrain_epochs,
+                fit_normalizer=not controller.normalizer_fitted,
+            )
+            csv_log.write(
+                f"{iteration},{len(failures)},{mean_robustness:.6f},{min_robustness:.6f},"
+                f"{metrics['train_loss']:.6f},{metrics['val_loss']:.6f}\n"
+            )
+            csv_log.flush()
+            controller.save_checkpoint(
+                str(outdir / f"cegis_iteration_{iteration}.pt"),
+                **checkpoint_metadata(args, phase="cegis", cegis_iteration=iteration),
+            )
+    finally:
+        csv_log.close()
+    controller.save_checkpoint(
+        str(outdir / "last_cegis.pt"),
+        **checkpoint_metadata(args, phase="cegis", cegis_iteration=args.cegis_iterations),
+    )
+    return outdir / "last_cegis.pt"
+
+
 # =============================================================================
 # Main
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(description="NNCS-Mamba Robust Trainer")
-    parser.add_argument("--phase", choices=["smoke", "imitation"], required=True)
+    parser.add_argument("--phase", choices=["smoke", "imitation", "cegis", "all"], required=True)
     parser.add_argument("--profile", choices=sorted(PROFILE_OVERRIDES.keys()), default="default")
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
@@ -309,6 +438,10 @@ def main():
     parser.add_argument("--num-traj", type=int, default=5000)
     parser.add_argument("--seq-steps", type=int, default=300)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--cegis-iterations", type=int, default=3)
+    parser.add_argument("--cegis-pop-size", type=int, default=50)
+    parser.add_argument("--cegis-max-failures", type=int, default=10)
+    parser.add_argument("--cegis-retrain-epochs", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--max-hours", type=float, default=2.5)
@@ -328,6 +461,10 @@ def main():
         "num_traj": 5000,
         "seq_steps": 300,
         "epochs": 10,
+        "cegis_iterations": 3,
+        "cegis_pop_size": 50,
+        "cegis_max_failures": 10,
+        "cegis_retrain_epochs": 2,
         "num_workers": 2,
         "val_split": 0.15,
         "max_hours": 2.5,
@@ -428,6 +565,15 @@ def main():
     # ── Imitation ──
     if args.phase == "imitation":
         run_imitation(controller, args, outdir, dataset, global_start_time)
+        return
+
+    if args.phase == "cegis":
+        run_cegis(controller, args, outdir, dataset, global_start_time)
+        return
+
+    if args.phase == "all":
+        run_imitation(controller, args, outdir, dataset, global_start_time)
+        run_cegis(controller, args, outdir, dataset, global_start_time)
         return
 
 

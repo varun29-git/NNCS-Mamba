@@ -138,6 +138,19 @@ def make_env_and_mpc(output_dir: str, seed: int, task_config: Dict[str, Any] | N
     return env, mpc
 
 
+def task_config_for_initial_state(initial_state: np.ndarray) -> Dict[str, Any]:
+    state = np.asarray(initial_state, dtype=float).reshape(-1)
+    if state.shape[0] != len(STATE_LABELS):
+        raise ValueError(f"Expected 12D initial state, got shape {state.shape}")
+    randomization = {}
+    for label, value in zip(STATE_LABELS, state):
+        randomization[f"init_{label}"] = {"distrib": "uniform", "low": float(value), "high": float(value)}
+    return {
+        "randomized_init": True,
+        "init_state_randomization_info": randomization,
+    }
+
+
 def get_goal_position(env=None, task_config: Dict[str, Any] | None = None) -> np.ndarray:
     if env is not None and hasattr(env, "X_GOAL"):
         goal = np.asarray(env.X_GOAL).reshape(-1)
