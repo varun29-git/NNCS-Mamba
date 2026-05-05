@@ -408,6 +408,18 @@ def generate_dataset(args, num_traj=None, seq_steps=None):
     return generate_expert_data(num_traj, seq_steps, 0.1)
 
 
+def checkpoint_metadata(args, **metadata):
+    metadata.update({
+        "plant_backend": args.plant_backend,
+        "plant_source": SAFE_CONTROL_GYM_SOURCE if args.plant_backend == "safe-control-gym" else "drone_env.py prototype",
+        "expert_controller": "safe-control-gym mpc" if args.plant_backend == "safe-control-gym" else "prototype pd expert",
+    })
+    if args.plant_backend == "safe-control-gym":
+        metadata["safe_control_gym_task_config"] = SAFE_CONTROL_GYM_TASK_CONFIG
+        metadata["safe_control_gym_mpc_config"] = SAFE_CONTROL_GYM_MPC_CONFIG
+    return metadata
+
+
 def fix_and_merge(failures, expert, plant, buffer, seq_steps, dt):
     """Takes failure states, has the expert fix them, and adds to buffer."""
     for state in failures:
@@ -479,11 +491,11 @@ def run_imitation(controller, args, outdir, dataset, global_start_time):
 
         if v_loss < best_val_loss:
             best_val_loss = v_loss
-            controller.save_checkpoint(str(outdir / "best_imitation.pt"), phase="imitation", epoch=epoch)
+            controller.save_checkpoint(str(outdir / "best_imitation.pt"), **checkpoint_metadata(args, phase="imitation", epoch=epoch))
             print("   -> Saved new best checkpoint.")
 
     csv_log.close()
-    controller.save_checkpoint(str(outdir / "last_imitation.pt"), phase="imitation", epoch=args.epochs)
+    controller.save_checkpoint(str(outdir / "last_imitation.pt"), **checkpoint_metadata(args, phase="imitation", epoch=args.epochs))
     print("\n[*] Imitation Phase Complete.")
     return outdir / "best_imitation.pt"
 
@@ -532,7 +544,7 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
 
         if num_fails == 0:
             print("\n✔️  CEGIS Converged! 100% Safety Coverage achieved.")
-            controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
+            controller.save_checkpoint(str(outdir / "best_cegis.pt"), **checkpoint_metadata(args, phase="cegis", cycle=cycle))
             break
 
         # 2. Expert Intervention
@@ -566,18 +578,18 @@ def run_cegis(controller, args, outdir, dataset, global_start_time):
         csv_log.flush()
 
         # Save progress
-        controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), phase="cegis", cycle=cycle)
+        controller.save_checkpoint(str(outdir / f"cegis_cycle_{cycle}.pt"), **checkpoint_metadata(args, phase="cegis", cycle=cycle))
         meaningful_coverage = coverage > 0.0
         if meaningful_coverage and (coverage > best_coverage or (coverage == best_coverage and v_loss < best_val_loss)):
             best_coverage = coverage
             best_val_loss = v_loss
-            controller.save_checkpoint(str(outdir / "best_cegis.pt"), phase="cegis", cycle=cycle)
+            controller.save_checkpoint(str(outdir / "best_cegis.pt"), **checkpoint_metadata(args, phase="cegis", cycle=cycle))
             print("   -> Saved new best CEGIS checkpoint.")
         elif not meaningful_coverage:
             print("   -> CEGIS coverage stayed at 0.00%; keeping imitation checkpoint as the recommended model.")
 
     csv_log.close()
-    controller.save_checkpoint(str(outdir / "last_cegis.pt"), phase="cegis", cycle=args.cegis_cycles)
+    controller.save_checkpoint(str(outdir / "last_cegis.pt"), **checkpoint_metadata(args, phase="cegis", cycle=args.cegis_cycles))
     print("\n[*] CEGIS Pipeline Finished.")
     return outdir / "best_cegis.pt"
 
@@ -645,6 +657,8 @@ def main():
     if args.controller in {"gru", "structured_gru"} and args.optimizer != "adamw":
         print("[*] Switching optimizer to AdamW for recurrent controller.")
         args.optimizer = "adamw"
+    if args.plant_backend == "safe-control-gym" and args.controller == "structured_gru":
+        raise ValueError("structured_gru is prototype-specific because it assumes 15D state+target observations.")
     
     global_start_time = time.time()
 
@@ -663,6 +677,7 @@ def main():
 
     obs_dim = 12 if args.plant_backend == "safe-control-gym" else 15
     action_dim = 4
+    action_clip = None if args.plant_backend == "safe-control-gym" else FORCE_LIMIT
 
     # Initialize Controller
     print("[*] Initializing controller...")
@@ -678,6 +693,7 @@ def main():
         use_gradient_checkpointing=not args.disable_gradient_checkpointing,
         late_timestep_weight=args.late_timestep_weight,
         recurrent_dropout=args.recurrent_dropout,
+        action_clip=action_clip,
     )
     print(f"    Device: {controller.device}")
     print(

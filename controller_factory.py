@@ -3,6 +3,7 @@ from typing import Any, Dict
 from gru_learner import GRUController
 from mamba_learner import MambaController
 from structured_gru_learner import StructuredGRUController
+from drone_env import FORCE_LIMIT
 
 
 def build_controller(
@@ -19,6 +20,7 @@ def build_controller(
     aux_state_weight: float = 0.5,
     late_timestep_weight: float = 1.0,
     recurrent_dropout: float = 0.1,
+    action_clip=FORCE_LIMIT,
 ):
     controller_key = (controller_type or "mamba").lower()
     if controller_key == "mamba":
@@ -33,6 +35,7 @@ def build_controller(
             use_gradient_checkpointing=use_gradient_checkpointing,
             aux_state_weight=aux_state_weight,
             late_timestep_weight=late_timestep_weight,
+            action_clip=action_clip,
         )
     if controller_key == "gru":
         return GRUController(
@@ -47,6 +50,7 @@ def build_controller(
             aux_state_weight=aux_state_weight,
             late_timestep_weight=late_timestep_weight,
             recurrent_dropout=recurrent_dropout,
+            action_clip=action_clip,
         )
     if controller_key == "structured_gru":
         return StructuredGRUController(
@@ -79,4 +83,5 @@ def build_controller_from_config(config: Dict[str, Any]):
         aux_state_weight=config.get("aux_state_weight", 0.5),
         late_timestep_weight=config.get("late_timestep_weight", 1.0),
         recurrent_dropout=config.get("recurrent_dropout", 0.1),
+        action_clip=config.get("action_clip", FORCE_LIMIT),
     )

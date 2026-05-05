@@ -32,6 +32,7 @@ class GRUController(LearnerController, nn.Module):
         aux_state_weight: float = 0.5,
         late_timestep_weight: float = 1.0,
         recurrent_dropout: float = 0.1,
+        action_clip: Optional[float] = FORCE_LIMIT,
     ):
         nn.Module.__init__(self)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,6 +55,7 @@ class GRUController(LearnerController, nn.Module):
         self.aux_state_weight = aux_state_weight
         self.late_timestep_weight = late_timestep_weight
         self.recurrent_dropout = recurrent_dropout
+        self.action_clip = action_clip
 
         self.register_buffer("obs_mean", torch.zeros(obs_dim, dtype=torch.float32))
         self.register_buffer("obs_scale", torch.ones(obs_dim, dtype=torch.float32))
@@ -134,6 +136,7 @@ class GRUController(LearnerController, nn.Module):
             "aux_state_weight": self.aux_state_weight,
             "late_timestep_weight": self.late_timestep_weight,
             "recurrent_dropout": self.recurrent_dropout,
+            "action_clip": self.action_clip,
         }
 
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
@@ -252,7 +255,10 @@ class GRUController(LearnerController, nn.Module):
         with torch.no_grad():
             obs_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(1, 1, -1)
             out = self._run_cached_step(obs_tensor)
-            return np.clip(out[0, 0, :].cpu().numpy(), -FORCE_LIMIT, FORCE_LIMIT)
+            action = out[0, 0, :].cpu().numpy()
+            if self.action_clip is None:
+                return action
+            return np.clip(action, -self.action_clip, self.action_clip)
 
     def _build_loader_from_dataset(
         self,

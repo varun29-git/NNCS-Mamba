@@ -28,6 +28,7 @@ class MambaController(LearnerController, nn.Module):
         use_gradient_checkpointing: bool = True,
         aux_state_weight: float = 0.5,
         late_timestep_weight: float = 1.0,
+        action_clip: Optional[float] = FORCE_LIMIT,
     ):
         nn.Module.__init__(self)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -49,6 +50,7 @@ class MambaController(LearnerController, nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.aux_state_weight = aux_state_weight
         self.late_timestep_weight = late_timestep_weight
+        self.action_clip = action_clip
 
         self.register_buffer("obs_mean", torch.zeros(obs_dim, dtype=torch.float32))
         self.register_buffer("obs_scale", torch.ones(obs_dim, dtype=torch.float32))
@@ -126,6 +128,7 @@ class MambaController(LearnerController, nn.Module):
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "aux_state_weight": self.aux_state_weight,
             "late_timestep_weight": self.late_timestep_weight,
+            "action_clip": self.action_clip,
         }
         
     def reset(self, max_seq_len: int = 5000, max_batch_size: int = 1) -> None:
@@ -240,8 +243,10 @@ class MambaController(LearnerController, nn.Module):
             self._ensure_inference_state()
             obs_tensor = torch.tensor(y, dtype=torch.float32, device=self.device).reshape(1, 1, -1)
             out = self._run_cached_step(obs_tensor)
-
-            return np.clip(out[0, 0, :].cpu().numpy(), -FORCE_LIMIT, FORCE_LIMIT)
+            action = out[0, 0, :].cpu().numpy()
+            if self.action_clip is None:
+                return action
+            return np.clip(action, -self.action_clip, self.action_clip)
 
     def _build_loader_from_dataset(
         self,
