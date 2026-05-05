@@ -17,8 +17,6 @@ import json
 import numpy as np
 import torch
 import time
-from functools import partial
-from importlib.util import find_spec
 from pathlib import Path
 from collections import deque
 from torch.utils.data import DataLoader, TensorDataset
@@ -30,57 +28,16 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 
 from controller_factory import build_controller
-
-
-SAFE_CONTROL_GYM_SOURCE = "https://github.com/learnsyslab/safe-control-gym"
-SAFE_CONTROL_GYM_TASK_CONFIG = {
-    "seed": 1337,
-    "ctrl_freq": 50,
-    "pyb_freq": 1000,
-    "gui": False,
-    "physics": "pyb",
-    "quad_type": 3,
-    "init_state_randomization_info": {
-        "init_x": {"distrib": "uniform", "low": -1, "high": 1},
-        "init_x_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-        "init_y": {"distrib": "uniform", "low": -1, "high": 1},
-        "init_y_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-        "init_z": {"distrib": "uniform", "low": 0.5, "high": 1.5},
-        "init_z_dot": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-        "init_phi": {"distrib": "uniform", "low": -0.2, "high": 0.2},
-        "init_theta": {"distrib": "uniform", "low": -0.2, "high": 0.2},
-        "init_psi": {"distrib": "uniform", "low": -0.2, "high": 0.2},
-        "init_p": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-        "init_q": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-        "init_r": {"distrib": "uniform", "low": -0.1, "high": 0.1},
-    },
-    "randomized_init": True,
-    "randomized_inertial_prop": False,
-    "task": "stabilization",
-    "task_info": {
-        "stabilization_goal": [0, 0, 1],
-        "stabilization_goal_tolerance": 0.0,
-        "proj_point": [0, 0, 0.5],
-        "proj_normal": [0, 1, 1],
-    },
-    "episode_len_sec": 6,
-    "cost": "quadratic",
-    "rew_state_weight": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    "rew_act_weight": [0.1],
-    "done_on_out_of_bound": True,
-}
-SAFE_CONTROL_GYM_MPC_CONFIG = {
-    "horizon": 20,
-    "r_mpc": [0.1, 0.1, 0.1, 0.1],
-    "q_mpc": [5.0, 0.1, 5.0, 0.1, 5.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
-    "prior_info": {
-        "prior_prop": None,
-        "randomize_prior_prop": False,
-        "prior_prop_rand_info": None,
-    },
-    "warmstart": True,
-    "solver": "ipopt",
-}
+from safe_control_gym_config import (
+    SAFE_CONTROL_GYM_MPC_CONFIG,
+    SAFE_CONTROL_GYM_SOURCE,
+    SAFE_CONTROL_GYM_TASK_CONFIG,
+    SAFE_CONTROL_GYM_VERSION,
+    make_env_and_mpc,
+    reset_gym_env,
+    step_gym_env,
+    write_benchmark_manifest,
+)
 
 
 PROFILE_OVERRIDES = {
@@ -121,6 +78,24 @@ PROFILE_OVERRIDES = {
         "late_timestep_weight": 2.5,
         "recurrent_dropout": 0.1,
     },
+    "mlp-baseline": {
+        "controller": "mlp",
+        "d_model": 192,
+        "d_state": 16,
+        "layers": 3,
+        "lr": 3e-4,
+        "batch_size": 64,
+        "num_traj": 4096,
+        "seq_steps": 300,
+        "epochs": 12,
+        "optimizer": "adamw",
+        "num_workers": 2,
+        "val_split": 0.10,
+        "max_hours": 2.8,
+        "disable_gradient_checkpointing": True,
+        "late_timestep_weight": 1.0,
+        "recurrent_dropout": 0.0,
+    },
 }
 
 DATASET_CACHE_VERSION = "v3"
@@ -140,34 +115,6 @@ def build_dataset_cache_path(args):
         f"baseline_dataset_{DATASET_CACHE_VERSION}_safe_control_gym_profile-{args.profile}"
         f"_traj-{args.num_traj}_steps-{args.seq_steps}.pt"
     )
-
-
-def require_safe_control_gym():
-    if find_spec("safe_control_gym") is None:
-        raise RuntimeError(
-            "safe_control_gym is required. "
-            "Install the upstream benchmark with `python -m pip install -e .` "
-            f"from {SAFE_CONTROL_GYM_SOURCE}."
-        )
-    from safe_control_gym.utils.registration import make
-
-    return make
-
-
-def reset_gym_env(env):
-    reset_result = env.reset()
-    if isinstance(reset_result, tuple) and len(reset_result) == 2:
-        return reset_result
-    return reset_result, {}
-
-
-def step_gym_env(env, action):
-    step_result = env.step(action)
-    if len(step_result) == 5:
-        obs, reward, terminated, truncated, info = step_result
-        return obs, reward, bool(terminated or truncated), info
-    obs, reward, done, info = step_result
-    return obs, reward, bool(done), info
 
 
 # =============================================================================
@@ -222,22 +169,11 @@ def create_cpu_dataloaders(dataset, batch_size, val_split=0.15, num_workers=2):
 
 def generate_safe_control_gym_expert_data(num_traj, seq_steps, args):
     print(f"[*] Harvesting {num_traj} Safe-Control-Gym MPC trajectories...")
-    make = require_safe_control_gym()
-    task_config = dict(SAFE_CONTROL_GYM_TASK_CONFIG)
-    task_config["seed"] = args.seed
-    env_func = partial(make, "quadrotor", output_dir=str(Path(args.outdir) / "safe_control_gym"), **task_config)
-    env = env_func()
-    mpc = make(
-        "mpc",
-        env_func,
-        training=False,
-        output_dir=str(Path(args.outdir) / "safe_control_gym"),
-        seed=args.seed,
-        **SAFE_CONTROL_GYM_MPC_CONFIG,
-    )
-    mpc.reset()
+    env, mpc = make_env_and_mpc(str(Path(args.outdir) / "safe_control_gym"), args.seed)
+    write_benchmark_manifest(Path(args.outdir) / "benchmark_manifest.json", env)
 
     dataset = []
+    mpc_wall_times = []
     try:
         for traj_idx in range(num_traj):
             obs, info = reset_gym_env(env)
@@ -247,7 +183,9 @@ def generate_safe_control_gym_expert_data(num_traj, seq_steps, args):
             act_seq = np.empty((seq_steps, 4), dtype=np.float32)
 
             for step_idx in range(seq_steps):
+                action_start = time.perf_counter()
                 action = np.asarray(mpc.select_action(obs, info), dtype=np.float32)
+                mpc_wall_times.append(time.perf_counter() - action_start)
                 obs_seq[step_idx] = np.asarray(obs, dtype=np.float32)
                 act_seq[step_idx] = action
 
@@ -264,6 +202,8 @@ def generate_safe_control_gym_expert_data(num_traj, seq_steps, args):
         mpc.close()
         env.close()
 
+    if mpc_wall_times:
+        print(f"    MPC label time: {np.mean(mpc_wall_times) * 1000.0:.2f} ms/action")
     return dataset
 
 
@@ -277,6 +217,7 @@ def checkpoint_metadata(args, **metadata):
     metadata.update({
         "plant_backend": "safe-control-gym",
         "plant_source": SAFE_CONTROL_GYM_SOURCE,
+        "safe_control_gym_version": SAFE_CONTROL_GYM_VERSION,
         "expert_controller": "safe-control-gym mpc",
         "safe_control_gym_task_config": SAFE_CONTROL_GYM_TASK_CONFIG,
         "safe_control_gym_mpc_config": SAFE_CONTROL_GYM_MPC_CONFIG,
@@ -351,7 +292,7 @@ def main():
     parser.add_argument("--profile", choices=sorted(PROFILE_OVERRIDES.keys()), default="default")
     parser.add_argument("--outdir", type=str, default="runs/experiment")
     parser.add_argument("--resume", type=str, default=None, help="Path to .pt checkpoint to resume from")
-    parser.add_argument("--controller", choices=["mamba", "gru"], default="mamba")
+    parser.add_argument("--controller", choices=["mamba", "gru", "mlp"], default="mamba")
 
     # Hyperparameters ('T4 Blitz' — Scaled for 3-hour window)
     parser.add_argument("--d-model", type=int, default=128)
@@ -393,7 +334,7 @@ def main():
     }
     args = parser.parse_args()
     apply_profile(args, defaults)
-    if args.controller == "gru" and args.optimizer != "adamw":
+    if args.controller in {"gru", "mlp"} and args.optimizer != "adamw":
         print("[*] Switching optimizer to AdamW for recurrent controller.")
         args.optimizer = "adamw"
     
