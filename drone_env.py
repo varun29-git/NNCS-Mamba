@@ -1,7 +1,21 @@
+"""
+Prototype drone environment.
+
+Research status:
+    This module is an exploratory simulator used to develop the learning,
+    CEGIS, and evaluation pipeline. It is not yet a validated quadrotor model
+    from literature or an established benchmark, so it should not be used as
+    the physical plant for final research claims without independent
+    derivation, citation, and validation.
+"""
+
 import numpy as np
 import torch
 import math
 from abstract_env import Plant, ExpertController
+
+RESEARCH_VALIDATED_PLANT = False
+PLANT_PROVENANCE = "prototype"
 
 # ==============================================================================
 # Checkpoint definitions (shared between Expert and STL checker)

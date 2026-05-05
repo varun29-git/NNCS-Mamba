@@ -2,6 +2,12 @@
 
 This repository implements a framework for training a neural‑network controller for a 12‑dimensional drone using Counter‑Example Guided Inductive Synthesis (CEGIS). The code is still being written and is not yet complete.
 
+## Research Hardening Status
+
+This repository currently contains an exploratory prototype. The custom plant and PD-style expert in `drone_env.py` are useful for developing the training pipeline, but they are not yet validated against a trusted quadrotor model from literature, MATLAB/MathWorks, or an established benchmark. Final research claims should use a validated plant and an existing MPC expert implementation, such as a pinned Safe-Control-Gym quadrotor/MPC setup, before comparing Mamba against baselines.
+
+The first trusted-backend boundary lives in `research_backends/`. It currently checks whether Safe-Control-Gym is available and records the intended provenance; it does not yet replace the prototype plant or controller.
+
 ## Overview
 - A simulated drone with a 12‑D state (position, velocity, tilt, angular rates).
 - The mission consists of three steps: reach checkpoint A, then checkpoint B, then dock at the origin.
