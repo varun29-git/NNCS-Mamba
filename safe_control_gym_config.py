@@ -8,6 +8,10 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
+# Configures the safe-control-gym benchmark environment and maps 
+# the standard 12-dimensional state vector (3D position, linear velocity, Euler angles, and body angular rates) 
+# required for quadrotor physical dynamics.
+
 SAFE_CONTROL_GYM_SOURCE = "https://github.com/learnsyslab/safe-control-gym"
 SAFE_CONTROL_GYM_VERSION = "v1.0.0"
 
@@ -25,12 +29,22 @@ STATE_LABELS = [
     "q",
     "r",
 ]
+
+
+# Specifies physical units for the state variables, 
+# labels the four motor control inputs, and defines NumPy index arrays for slicing 
+# of position, velocity, and attitude data from the full 12D state vector.
+
 STATE_UNITS = ["m", "m/s", "m", "m/s", "m", "m/s", "rad", "rad", "rad", "rad/s", "rad/s", "rad/s"]
 ACTION_LABELS = ["motor_1", "motor_2", "motor_3", "motor_4"]
 
 POSITION_IDX = np.array([0, 2, 4])
 VELOCITY_IDX = np.array([1, 3, 5])
 ANGLE_IDX = np.array([6, 7, 8])
+
+
+# Defines the core simulation parameters, stabilization objectives, initial state randomization boundaries, 
+# and quadratic cost functions for the PyBullet quadrotor environment.
 
 SAFE_CONTROL_GYM_TASK_CONFIG: Dict[str, Any] = {
     "seed": 1337,
@@ -75,6 +89,11 @@ SAFE_CONTROL_GYM_TASK_CONFIG: Dict[str, Any] = {
     "disturbances": None,
 }
 
+
+# Configures the Model Predictive Control (MPC) parameters, defining the 20-step prediction horizon, 
+# state and action penalty matrices for optimization, and specifying the IPOPT solver with warm-starting for 
+# real-time performance.
+
 SAFE_CONTROL_GYM_MPC_CONFIG: Dict[str, Any] = {
     "horizon": 20,
     "r_mpc": [0.1, 0.1, 0.1, 0.1],
@@ -89,6 +108,8 @@ SAFE_CONTROL_GYM_MPC_CONFIG: Dict[str, Any] = {
 }
 
 
+# Verifies the installation of the safe-control-gym dependency, 
+# raising a guided runtime error if missing, and returns the environment creation factory function.
 def require_safe_control_gym():
     if find_spec("safe_control_gym") is None:
         raise RuntimeError(
@@ -100,6 +121,9 @@ def require_safe_control_gym():
 
     return make
 
+# Provides a compatibility wrapper for environment initialization, 
+# ensuring the output always conforms to the modern Gymnasium API standard of returning an 
+# (observation, info) tuple, preventing unpacking errors across different library versions.
 
 def reset_gym_env(env):
     reset_result = env.reset()
@@ -108,6 +132,9 @@ def reset_gym_env(env):
     return reset_result, {}
 
 
+# Provides a compatibility wrapper for environment stepping, converting the modern Gymnasium 5-tuple return 
+# (obs, reward, terminated, truncated, info) back into the legacy Gym 4-tuple format (obs, reward, done, info) 
+# to prevent unpacking errors during the training loop.
 def step_gym_env(env, action):
     step_result = env.step(action)
     if len(step_result) == 5:
