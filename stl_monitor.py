@@ -1,16 +1,3 @@
-"""Quantitative STL robustness for the Safe-Control-Gym stabilization task.
-
-The formulas here use standard min/max quantitative semantics:
-    G phi = min_t rho(phi, t)
-    F phi = max_t rho(phi, t)
-    phi AND psi = min(rho(phi), rho(psi))
-
-The current benchmark task is stabilization, so the default specification is:
-    G safe_state
-    AND G input_within_bounds
-    AND F_[0,T] near_goal
-    AND F_[0,T] G_[t,T] settled
-"""
 
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -24,16 +11,23 @@ from safe_control_gym_config import state_angles, state_position, state_velocity
 class STLSpec:
     goal_position: np.ndarray
     position_tolerance: float = 0.25
+    # This defines a radius around the goal position. If the agent enters this sphere, it successfully completes the navigation phase.
     settle_position_tolerance: float = 0.35
+    # Once the goal is reached, the agent is allowed a slightly wider radius to hover and maneuver without being penalized for tiny deviations.
     settle_speed_tolerance: float = 0.25
+    # The kinetic energy of the agent must bleed off. Its velocity must drop below this threshold to prove it has successfully stabilized at the target location.
     x_bound: float = 2.5
     y_bound: float = 2.5
+    # The agent must stay within the [-2.5, 2.5] coordinate range on both axes to avoid leaving the valid operational area. (Always)
     z_min: float = 0.0
     z_max: float = 2.5
+    # The agent cannot crash into the ground (dropping below 0.0) and has a maximum flight ceiling of 2.5 units. (Always)
     max_abs_angle: float = 0.75
     reach_deadline_step: Optional[int] = None
+    # A temporal constraint defining the maximum number of time steps the agent is allowed to take to reach the goal.
 
 
+# This Python function calculates the "Always" (or Globally) operator for Signal Temporal Logic (STL)
 def suffix_always(signal: np.ndarray) -> np.ndarray:
     out = np.empty_like(signal, dtype=np.float64)
     running = np.inf
@@ -43,6 +37,7 @@ def suffix_always(signal: np.ndarray) -> np.ndarray:
     return out
 
 
+# This Python function calculates the "Eventually" (or Finally) operator for Signal Temporal Logic
 def eventually(signal: np.ndarray, end_idx: Optional[int] = None) -> float:
     if len(signal) == 0:
         return -np.inf
@@ -80,7 +75,10 @@ def evaluate_stabilization_stl(
         spec.z_max - positions[:, 2],
         spec.max_abs_angle - np.max(np.abs(angles), axis=1),
     ])
+    # for each timestep, find closest boundary
+
     state_safety = always(state_safety_signal)
+    # find the worst timestep in the whole trajectory
 
     input_safety = np.inf
     if actions is not None and action_low is not None and action_high is not None and len(actions) > 0:
