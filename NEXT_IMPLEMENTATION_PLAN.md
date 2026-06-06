@@ -62,6 +62,43 @@ docs/ALPHAGO_IDEAS_FOR_NNCS.pdf
 
 ## Implementation Order
 
+## Current Local Status
+
+Completed in the rebuild process:
+
+- Removed the old learner/training stack.
+- Created a fresh local `.venv` with Python 3.11.
+- Installed the non-PyBullet foundation dependencies.
+- Installed the pinned Safe-Control-Gym package with `--no-deps` to avoid the old Torch dependency conflict.
+- Confirmed `tests/test_stl_monitor.py` passes in `.venv`.
+- Added `verify_safe_control_gym.py`.
+- Added `verify_stl_on_expert.py`.
+
+Current local blocker:
+
+```text
+pybullet is not installed.
+```
+
+Both verifier scripts currently stop with a clear blocked message because PyBullet failed to build from source on this macOS environment. This is a local simulator dependency issue, not a logic issue in the verifier scripts.
+
+Observed failure:
+
+```text
+pip install pybullet==3.2.7
+-> Failed building wheel for pybullet
+```
+
+Next environment task:
+
+- Install PyBullet through a working route, preferably a Python/environment combination with a prebuilt wheel, or a Conda environment where PyBullet is available.
+- Then rerun:
+
+```text
+.venv/bin/python verify_safe_control_gym.py --steps 5
+.venv/bin/python verify_stl_on_expert.py --rollouts 3 --steps 100
+```
+
 ### Step 1: Verify Safe-Control-Gym Interface
 
 Create:
