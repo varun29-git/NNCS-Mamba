@@ -1,0 +1,474 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=0.85in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{listings}
+
+\definecolor{navy}{HTML}{18324A}
+\definecolor{teal}{HTML}{0B6B72}
+\definecolor{green}{HTML}{2E7D32}
+\definecolor{red}{HTML}{B3261E}
+\definecolor{softgray}{HTML}{F5F7FA}
+\definecolor{linegray}{HTML}{D7DEE8}
+\definecolor{codebg}{HTML}{F7F9FC}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=teal,
+  urlcolor=teal,
+  citecolor=teal
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{navy}{NNCS-Mamba}}
+\rhead{\textcolor{navy}{STL Monitor Report}}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\setlength{\headheight}{14pt}
+\setlength{\tabcolsep}{4pt}
+\sloppy
+
+\lstdefinestyle{pythonstyle}{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{teal}\bfseries,
+  commentstyle=\color{green!60!black},
+  stringstyle=\color{red!70!black},
+  showstringspaces=false,
+  frame=single,
+  rulecolor=\color{linegray},
+  breaklines=true,
+  columns=fullflexible
+}
+\lstset{style=pythonstyle}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\metric}[1]{{\footnotesize\texttt{#1}}}
+\newcommand{\rob}{\rho}
+\newcommand{\traj}{\xi}
+\newcommand{\reportbox}[2]{
+  \vspace{4pt}
+  \noindent\colorbox{softgray}{
+    \parbox{\dimexpr0.98\linewidth-2\fboxsep\relax}{
+      \textbf{\textcolor{navy}{#1}}\par
+      #2
+    }
+  }
+  \vspace{4pt}
+}
+
+\title{
+  \vspace{-1.2cm}
+  \textbf{\textcolor{navy}{STL Robustness Monitor Implementation Report}}\\
+  \large NNCS-Mamba Stabilization Evaluation
+}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\reportbox{Report Objective}{
+This document reports the mechanics of \code{stl\_monitor.py}. The monitor converts one complete drone rollout into quantitative Signal Temporal Logic (STL) robustness scores. The implementation is used to evaluate whether a controller keeps the drone safe, reaches the goal, and remains settled near the goal.
+}
+
+\section{Role of the Monitor in the Project}
+
+The STL monitor is not a controller and it does not change the drone action. Its role is evaluation. Given a completed trajectory, it computes a scalar robustness value:
+
+\[
+\rob(\traj) > 0 \quad \Rightarrow \quad \text{trajectory satisfies the STL specification}
+\]
+\[
+\rob(\traj) < 0 \quad \Rightarrow \quad \text{trajectory violates at least one part of the specification}
+\]
+
+In the training pipeline, a negative robustness value can be treated as a counterexample. Such trajectories are useful for counterexample-guided retraining because they show where the learned controller failed relative to the formal requirement.
+
+\section{Inputs and State Convention}
+
+The main function is:
+
+\begin{lstlisting}[language=Python]
+evaluate_stabilization_stl(states, actions, spec, action_low, action_high)
+\end{lstlisting}
+
+The expected inputs are summarized below.
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.24\linewidth}p{0.66\linewidth}}
+\toprule
+Input & Meaning \\
+\midrule
+\code{states} & Array with shape \code{[T, 12]}. It contains the drone state at each timestep of one rollout. \\
+\code{actions} & Optional array with shape \code{[T, nu]}. It contains the applied thrust/control input at each timestep. \\
+\code{spec} & An \code{STLSpec} object containing the goal position and safety thresholds. \\
+\code{action\_low} & Optional lower bounds for each action component. \\
+\code{action\_high} & Optional upper bounds for each action component. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The monitor uses helper functions from \code{safe\_control\_gym\_config.py} to extract the relevant components:
+
+\[
+p_t = [x_t, y_t, z_t], \qquad
+v_t = [\dot{x}_t, \dot{y}_t, \dot{z}_t], \qquad
+\theta_t = [\phi_t, \theta_t, \psi_t]
+\]
+
+Here, \(p_t\) is position, \(v_t\) is velocity, and \(\theta_t\) contains the three attitude angles. The monitor uses all three angles through the maximum absolute angle.
+
+\section{Specification Parameters}
+
+The dataclass \code{STLSpec} stores the numerical requirements used by the monitor.
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.36\linewidth}p{0.43\linewidth}p{0.09\linewidth}}
+\toprule
+Field & Meaning & Default \\
+\midrule
+\metric{goal\_position} & Target 3D position for stabilization. & required \\
+\metric{position\_tolerance} & Radius used to decide whether the drone has reached the goal. & 0.25 \\
+\metric{settle\_position\_tolerance} & Radius allowed after the drone has settled. & 0.35 \\
+\metric{settle\_speed\_tolerance} & Maximum speed allowed after settling. & 0.25 \\
+\metric{x\_bound}, \metric{y\_bound} & Horizontal safety limits. & 2.5 \\
+\metric{z\_min}, \metric{z\_max} & Floor and ceiling limits. & 0.0, 2.5 \\
+\metric{max\_abs\_angle} & Maximum allowed absolute attitude angle. & 0.75 \\
+\metric{reach\_deadline\_step} & Optional deadline for reaching the goal. & None \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These values define margins, not binary pass/fail labels. A positive margin means the requirement is satisfied with clearance. A negative margin means it is violated.
+
+\section{Implemented STL Formula}
+
+The monitor evaluates the following stabilization requirement:
+
+\[
+\varphi =
+\mathbf{G}(\text{state safe})
+\;\land\;
+\mathbf{G}(\text{input safe})
+\;\land\;
+\mathbf{F}(\text{near goal})
+\;\land\;
+\mathbf{F}\mathbf{G}(\text{settled})
+\]
+
+In words, the trajectory must:
+
+\begin{itemize}
+  \item always remain inside the allowed state boundaries,
+  \item always respect the input limits when action bounds are provided,
+  \item eventually enter the goal region,
+  \item eventually become settled and remain settled until the end of the rollout.
+\end{itemize}
+
+The final robustness is the minimum robustness among these four parts. This matches the quantitative STL interpretation of conjunction: the weakest requirement determines the robustness of the whole formula.
+
+\section{Temporal Operators}
+
+\subsection{\code{always(signal)}}
+
+\code{always} implements the STL globally operator \(\mathbf{G}\). For a robustness signal \(s_0, s_1, \ldots, s_{T-1}\), it returns:
+
+\[
+\mathbf{G}(s) = \min_{0 \leq t < T} s_t
+\]
+
+This is used when the requirement must hold for the complete trajectory. One violation is enough to make the global robustness negative.
+
+\begin{lstlisting}[language=Python]
+def always(signal: np.ndarray) -> float:
+    if len(signal) == 0:
+        return -np.inf
+    return float(np.min(signal))
+\end{lstlisting}
+
+\subsection{\code{eventually(signal, end\_idx=None)}}
+
+\code{eventually} implements the STL finally operator \(\mathbf{F}\). It returns:
+
+\[
+\mathbf{F}(s) = \max_{0 \leq t \leq T-1} s_t
+\]
+
+If a deadline is supplied, the maximum is only taken up to that timestep:
+
+\[
+\mathbf{F}_{[0,d]}(s) = \max_{0 \leq t \leq d} s_t
+\]
+
+This is used for reachability: the drone only needs to be close to the goal at least once.
+
+\begin{lstlisting}[language=Python]
+def eventually(signal: np.ndarray, end_idx: Optional[int] = None) -> float:
+    if len(signal) == 0:
+        return -np.inf
+    if end_idx is None:
+        end_idx = len(signal) - 1
+    end_idx = min(end_idx, len(signal) - 1)
+    return float(np.max(signal[: end_idx + 1]))
+\end{lstlisting}
+
+\subsection{\code{suffix\_always(signal)}}
+
+\code{suffix\_always} computes the robustness of ``always from this timestep to the end'' for every timestep:
+
+\[
+\text{suffix\_always}(s)_t = \min_{k \geq t} s_k
+\]
+
+This is needed for the formula \(\mathbf{F}\mathbf{G}(\text{settled})\). The monitor first asks: if settling begins at timestep \(t\), does the drone remain settled for the rest of the rollout? Then \code{eventually} checks whether any such timestep exists.
+
+\begin{lstlisting}[language=Python]
+def suffix_always(signal: np.ndarray) -> np.ndarray:
+    out = np.empty_like(signal, dtype=np.float64)
+    running = np.inf
+    for idx in range(len(signal) - 1, -1, -1):
+        running = min(running, float(signal[idx]))
+        out[idx] = running
+    return out
+\end{lstlisting}
+
+\section{State Safety Robustness}
+
+At each timestep, the monitor computes five safety margins:
+
+\[
+m^x_t = x_{\max} - |x_t|
+\]
+\[
+m^y_t = y_{\max} - |y_t|
+\]
+\[
+m^{z,\min}_t = z_t - z_{\min}
+\]
+\[
+m^{z,\max}_t = z_{\max} - z_t
+\]
+\[
+m^\theta_t = \theta_{\max} - \max(|\phi_t|, |\theta_t|, |\psi_t|)
+\]
+
+The state safety signal at timestep \(t\) is the smallest of these margins:
+
+\[
+s^{state}_t =
+\min(m^x_t, m^y_t, m^{z,\min}_t, m^{z,\max}_t, m^\theta_t)
+\]
+
+This value represents the closest active state-safety threat at that timestep. The full-trajectory state safety robustness is:
+
+\[
+\rob_{state} = \mathbf{G}(s^{state}) = \min_t s^{state}_t
+\]
+
+\begin{lstlisting}[language=Python]
+state_safety_signal = np.minimum.reduce([
+    spec.x_bound - np.abs(positions[:, 0]),
+    spec.y_bound - np.abs(positions[:, 1]),
+    positions[:, 2] - spec.z_min,
+    spec.z_max - positions[:, 2],
+    spec.max_abs_angle - np.max(np.abs(angles), axis=1),
+])
+state_safety = always(state_safety_signal)
+\end{lstlisting}
+
+\section{Input Safety Robustness}
+
+Input safety is evaluated only when \code{actions}, \code{action\_low}, and \code{action\_high} are provided. For each action component, two margins are computed:
+
+\[
+m^{low}_{t,i} = u_{t,i} - u^{low}_i
+\]
+\[
+m^{high}_{t,i} = u^{high}_i - u_{t,i}
+\]
+
+The input safety signal at timestep \(t\) is:
+
+\[
+s^{input}_t =
+\min_i(m^{low}_{t,i}, m^{high}_{t,i})
+\]
+
+The trajectory-level input safety robustness is:
+
+\[
+\rob_{input} = \mathbf{G}(s^{input})
+\]
+
+If no action bounds are supplied, the implementation sets \(\rob_{input} = \infty\). This means the input-safety term does not constrain the final minimum in that evaluation.
+
+\begin{lstlisting}[language=Python]
+low_margin = actions - np.asarray(action_low).reshape(1, -1)
+high_margin = np.asarray(action_high).reshape(1, -1) - actions
+input_safety = always(np.minimum(
+    np.min(low_margin, axis=1),
+    np.min(high_margin, axis=1),
+))
+\end{lstlisting}
+
+\section{Reach Robustness}
+
+The distance to the goal is:
+
+\[
+d_t = \|p_t - p_{goal}\|_2
+\]
+
+The reach signal is:
+
+\[
+s^{reach}_t = r_{reach} - d_t
+\]
+
+where \(r_{reach}\) is \code{position\_tolerance}. The reach requirement is satisfied if this signal becomes positive at least once:
+
+\[
+\rob_{reach} = \mathbf{F}(s^{reach})
+\]
+
+If a deadline is configured, the maximum is only taken before or at that deadline.
+
+\begin{lstlisting}[language=Python]
+distance_to_goal = np.linalg.norm(
+    positions - spec.goal_position.reshape(1, 3),
+    axis=1,
+)
+reach_signal = spec.position_tolerance - distance_to_goal
+eventually_reach = eventually(reach_signal, spec.reach_deadline_step)
+\end{lstlisting}
+
+\section{Settled Robustness}
+
+The monitor separates reaching the goal from stabilizing at the goal. A drone may briefly pass through the target region but still fail to hover there. For this reason, settling uses both position and speed:
+
+\[
+s^{settle}_t =
+\min(r_{settle} - d_t,\; v_{settle} - \|v_t\|_2)
+\]
+
+The drone is considered settled at timestep \(t\) only when it is close enough to the goal and slow enough.
+
+The full settled requirement is:
+
+\[
+\rob_{settled} =
+\mathbf{F}\mathbf{G}(s^{settle})
+\]
+
+This means that there must exist a timestep after which the drone remains settled until the rollout ends.
+
+\begin{lstlisting}[language=Python]
+settled_signal = np.minimum(
+    spec.settle_position_tolerance - distance_to_goal,
+    spec.settle_speed_tolerance - speed,
+)
+eventually_always_settled = eventually(suffix_always(settled_signal))
+\end{lstlisting}
+
+\section{Final Robustness Calculation}
+
+The final robustness value is:
+
+\[
+\rob =
+\min(
+\rob_{state},
+\rob_{input},
+\rob_{reach},
+\rob_{settled}
+)
+\]
+
+The implementation returns both the final score and the component scores:
+
+\begin{lstlisting}[language=Python]
+robustness = min(
+    state_safety,
+    input_safety,
+    eventually_reach,
+    eventually_always_settled,
+)
+\end{lstlisting}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.47\linewidth}p{0.43\linewidth}}
+\toprule
+Returned key & Interpretation \\
+\midrule
+\metric{stl\_robustness} & Final robustness of the full STL formula. \\
+\metric{stl\_satisfied} & 1.0 if final robustness is non-negative, otherwise 0.0. \\
+\metric{state\_safety\_robustness} & Worst state-safety margin over the trajectory. \\
+\metric{input\_safety\_robustness} & Worst input-limit margin over the trajectory. \\
+\metric{eventually\_reach\_robustness} & Best goal-reaching margin over the trajectory. \\
+\metric{eventually\_always\_settled\_robustness} & Best timestep from which the drone remains settled. \\
+\metric{min\_distance\_to\_goal} & Closest distance to the goal during the rollout. \\
+\metric{final\_distance\_to\_goal} & Distance to the goal at the final timestep. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Function-by-Function Summary}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.39\linewidth}p{0.51\linewidth}}
+\toprule
+Function or object & Purpose in the monitor \\
+\midrule
+\code{STLSpec} & Stores the formal thresholds for the stabilization task. \\
+\code{always} & Implements global STL robustness by taking the minimum over time. \\
+\code{eventually} & Implements reachability STL robustness by taking the maximum over time. \\
+\code{suffix\_always} & Computes future-global robustness from every timestep, used for settling. \\
+\metric{evaluate\_stabilization\_stl} & Computes state safety, input safety, reach, settled behavior, and final robustness. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Counterexample Interpretation}
+
+For CEGIS-style retraining, the important decision is:
+
+\[
+\rob(\traj) < 0
+\]
+
+If the final robustness is negative, then at least one required part of the STL formula failed. The complete rollout can be stored as a counterexample because it demonstrates a concrete failure mode of the current controller. The component robustness values identify the cause of failure, for example:
+
+\begin{itemize}
+  \item negative state safety: boundary, floor, ceiling, or angle violation;
+  \item negative input safety: action limit violation;
+  \item negative reach robustness: goal region was never reached;
+  \item negative settled robustness: the drone did not remain close and slow after reaching the goal.
+\end{itemize}
+
+\section{Validation Notes and Limitations}
+
+The implementation is intentionally small and inspectable. It uses standard quantitative STL operations: minimum for conjunction/global requirements and maximum for eventually requirements.
+
+Current limitations are:
+
+\begin{itemize}
+  \item The monitor is specialized to stabilization-style tasks around one goal position.
+  \item The current formula does not yet encode waypoint sequences or docking geometry.
+  \item The monitor assumes the state ordering supplied by \code{safe\_control\_gym\_config.py}; any environment change must preserve or update that mapping.
+  \item The returned robustness is only as meaningful as the chosen thresholds in \code{STLSpec}.
+\end{itemize}
+
+The main validation requirement is to test the formulas on hand-constructed trajectories: clearly safe trajectories should produce positive robustness, and trajectories with known violations should produce negative robustness in the corresponding component.
+
+\end{document}

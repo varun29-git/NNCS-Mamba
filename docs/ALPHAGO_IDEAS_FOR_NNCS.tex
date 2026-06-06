@@ -1,0 +1,486 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=0.85in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{listings}
+
+\definecolor{navy}{HTML}{18324A}
+\definecolor{teal}{HTML}{0B6B72}
+\definecolor{softgray}{HTML}{F5F7FA}
+\definecolor{linegray}{HTML}{D7DEE8}
+\definecolor{codebg}{HTML}{F7F9FC}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=teal,
+  urlcolor=teal,
+  citecolor=teal
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{navy}{NNCS-Mamba}}
+\rhead{\textcolor{navy}{AlphaGo-Inspired Research Ideas}}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt}
+\setlength{\headheight}{14pt}
+\setlength{\tabcolsep}{4pt}
+\sloppy
+
+\lstdefinestyle{plainstyle}{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  frame=single,
+  rulecolor=\color{linegray},
+  breaklines=true,
+  columns=fullflexible,
+  showstringspaces=false
+}
+\lstset{style=plainstyle}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\metric}[1]{{\footnotesize\texttt{#1}}}
+\newcommand{\reportbox}[2]{
+  \vspace{4pt}
+  \noindent\colorbox{softgray}{
+    \parbox{\dimexpr0.98\linewidth-2\fboxsep\relax}{
+      \textbf{\textcolor{navy}{#1}}\par
+      #2
+    }
+  }
+  \vspace{4pt}
+}
+
+\title{
+  \vspace{-1.2cm}
+  \textbf{\textcolor{navy}{AlphaGo-Inspired Extensions for NNCS-Mamba}}\\
+  \large Value Prediction, CEGIS Prioritization, and Soft MPC Targets
+}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\reportbox{Objective}{
+This document proposes specific AlphaGo-inspired extensions for NNCS-Mamba. The aim is not to use AlphaGo's game-specific tree search directly, but to adapt its broader design principle: a slow improvement mechanism produces richer supervision, and a neural model distills that supervision into fast inference.
+}
+
+\section{Relevant AlphaGo Pattern}
+
+The useful pattern from AlphaGo is:
+
+\begin{lstlisting}
+expensive improvement procedure -> richer supervision -> fast neural policy
+\end{lstlisting}
+
+In AlphaGo, Monte Carlo Tree Search (MCTS) improves the raw policy network's move distribution. The network is then trained to imitate this improved distribution, so expensive search is gradually distilled into a faster policy/value model.
+
+For NNCS-Mamba, the corresponding improvement mechanism is not MCTS. The drone-control setting is continuous-action and physics-based, so Model Predictive Control (MPC) is the more natural planner. Signal Temporal Logic (STL) robustness provides the formal evaluator for safety and task satisfaction.
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.33\linewidth}p{0.55\linewidth}}
+\toprule
+AlphaGo component & NNCS-Mamba analogue \\
+\midrule
+MCTS improvement & MPC correction plus STL falsification \\
+Policy network & Mamba/GRU/MLP action predictor \\
+Value network & Predicted STL robustness or safety margin \\
+Self-play loop & Rollout, falsify, relabel, retrain loop \\
+MCTS visit distribution & Soft local action distribution around MPC action \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The project can therefore be framed as improvement distillation:
+
+\begin{lstlisting}
+MPC + STL produce high-quality supervision.
+Mamba distills that supervision into fast inference.
+CEGIS identifies failure regions and adds corrective data.
+\end{lstlisting}
+
+\section{Idea 1: STL Robustness Value Head}
+
+\subsection{Core Proposal}
+
+AlphaGo uses both a policy head and a value head. The policy head predicts what action to take; the value head predicts how promising the current position is.
+
+For NNCS-Mamba, the policy head already exists as the action predictor. The proposed value target should be:
+
+\[
+\hat{\rho}_{STL}
+\]
+
+where \(\rho_{STL}\) is the quantitative STL robustness score returned by the monitor. A positive score indicates satisfaction of the formal specification, while a negative score indicates violation.
+
+The architecture becomes:
+
+\begin{lstlisting}
+shared Mamba encoder
+    -> policy head: predicted control action
+    -> value head: predicted STL robustness
+\end{lstlisting}
+
+\subsection{Why STL Robustness Is the Correct Value Target}
+
+The value head should not predict a vague reward. STL robustness is preferable because it is already part of the research specification:
+
+\begin{itemize}
+  \item \(\rho_{STL} > 0\): the trajectory satisfies the safety/task formula;
+  \item \(\rho_{STL} < 0\): at least one required condition is violated;
+  \item \(|\rho_{STL}|\): the margin of satisfaction or violation.
+\end{itemize}
+
+This makes the value head interpretable. It estimates the formal safety margin that will later be checked by the actual STL monitor.
+
+\subsection{Training Targets}
+
+The simplest target is final trajectory robustness:
+
+\[
+y_{value} = \rho_{STL}(\xi)
+\]
+
+where \(\xi\) is one complete rollout.
+
+A stronger version predicts multiple STL components:
+
+\[
+y_{value} =
+\begin{bmatrix}
+\rho_{total} \\
+\rho_{state} \\
+\rho_{input} \\
+\rho_{reach} \\
+\rho_{settled}
+\end{bmatrix}
+\]
+
+This is more diagnostic because it can distinguish boundary failures, input violations, failure to reach the goal, and failure to settle.
+
+\subsection{Loss Function}
+
+The combined objective can be:
+
+\[
+\mathcal{L}_{total}
+=
+\mathcal{L}_{action}
++
+\lambda_v \mathcal{L}_{value}
+\]
+
+with:
+
+\[
+\mathcal{L}_{action}
+=
+\| \hat{u}_t - u^{MPC}_t \|_2^2
+\]
+
+\[
+\mathcal{L}_{value}
+=
+\mathrm{Huber}(\hat{\rho}_{STL}, \rho_{STL})
+\]
+
+An optional binary satisfaction term can also be included:
+
+\[
+y_{safe} = I[\rho_{STL} \geq 0]
+\]
+
+\[
+\mathcal{L}_{total}
+=
+\mathcal{L}_{action}
++
+\lambda_v \mathcal{L}_{value}
++
+\lambda_s \mathcal{L}_{safe}
+\]
+
+This trains the model to predict both a continuous safety margin and a safe/unsafe classification.
+
+\section{Optional Extension: Value-Guided CEGIS Prioritization}
+
+\subsection{Motivation}
+
+Counterexample-guided learning can be expensive because many rollouts may need to be evaluated and relabeled by MPC. A value head can help prioritize which rollouts or states should receive expensive expert attention.
+
+The value head should not replace the STL monitor. It should only act as a triage model. The actual STL monitor remains the final authority.
+
+\subsection{Proposed Loop}
+
+\begin{lstlisting}
+1. Train Mamba on MPC demonstrations.
+2. Roll out Mamba under many initial states or disturbances.
+3. Predict STL robustness using the value head.
+4. Prioritize low-robustness or negative-robustness cases.
+5. Evaluate those cases using the real STL monitor.
+6. For confirmed failures, relabel or correct using MPC.
+7. Add corrected samples to the dataset.
+8. Retrain Mamba.
+\end{lstlisting}
+
+\subsection{Prioritization Score}
+
+The simplest priority score is:
+
+\[
+P(\xi) = -\hat{\rho}_{STL}(\xi)
+\]
+
+Lower predicted robustness gives higher priority.
+
+If uncertainty estimates are available, a better score is:
+
+\[
+P(\xi)
+=
+-\hat{\rho}_{STL}(\xi)
++
+\beta \cdot U(\xi)
+\]
+
+where \(U(\xi)\) is model uncertainty. This encourages the system to inspect trajectories that are both risky and uncertain.
+
+\subsection{Evaluation Criteria}
+
+Value-guided CEGIS should be compared against random or uniform rollout selection. The relevant metrics are:
+
+\begin{itemize}
+  \item unsafe trajectories found per rollout;
+  \item MPC relabeling calls required per improvement;
+  \item STL satisfaction rate after each CEGIS iteration;
+  \item robustness distribution before and after retraining;
+  \item violation-detection AUROC of the value head.
+\end{itemize}
+
+The core research question is:
+
+\begin{quote}
+Does predicted STL robustness help CEGIS find useful failures faster than random rollout selection?
+\end{quote}
+
+\section{Idea 2: Soft Target Distributions Around MPC Actions}
+
+\subsection{Problem with Single-Point Imitation}
+
+Standard imitation treats the MPC action as one exact label:
+
+\[
+x_t \mapsto u_t^{MPC}
+\]
+
+This is useful but incomplete. In many states, several nearby actions may be safe and effective, while others may be slightly worse or unsafe. A single hard target hides this local action landscape.
+
+AlphaGo's training signal is richer because MCTS produces an improved move distribution, not only one best move. The analogous idea here is to build a soft local action distribution around the MPC action.
+
+\subsection{Concrete Example}
+
+Suppose MPC returns:
+
+\[
+u^* = 0.80
+\]
+
+Instead of training only on \(0.80\), sample nearby candidate actions:
+
+\[
+\{0.78,\;0.80,\;0.82,\;0.85\}
+\]
+
+Each candidate is tested using a short rollout, local model prediction, MPC cost, constraint margin, or STL-inspired margin. The candidates are then converted into a soft target:
+
+\begin{center}
+\begin{tabular}{>{\bfseries}c c}
+\toprule
+Candidate action & Target weight \\
+\midrule
+0.78 & 0.25 \\
+0.80 & 0.40 \\
+0.82 & 0.25 \\
+0.85 & 0.10 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This teaches Mamba that \(0.80\) is best, \(0.78\) and \(0.82\) are also acceptable, and \(0.85\) is less preferred. The model learns the landscape of safe actions rather than memorizing one rigid value.
+
+\subsection{Continuous-Action Formulation}
+
+At state \(x_t\), MPC returns \(u_t^*\). Generate \(K\) action candidates:
+
+\[
+u_t^{(k)}
+=
+\mathrm{clip}(u_t^* + \epsilon_k,\; u_{low},\; u_{high})
+\]
+
+Each candidate receives a score:
+
+\[
+s_k = q(x_t, u_t^{(k)})
+\]
+
+The score \(q\) can be based on:
+
+\begin{itemize}
+  \item short-horizon tracking error;
+  \item MPC stage cost;
+  \item distance to state or input constraints;
+  \item predicted STL margin;
+  \item a weighted combination of cost and safety margin.
+\end{itemize}
+
+The scores are converted into weights:
+
+\[
+w_k
+=
+\frac{\exp(s_k / \tau)}
+{\sum_j \exp(s_j / \tau)}
+\]
+
+If lower cost is better:
+
+\[
+w_k
+=
+\frac{\exp(-c_k / \tau)}
+{\sum_j \exp(-c_j / \tau)}
+\]
+
+The temperature \(\tau\) controls target sharpness. Low temperature makes the target close to the best candidate; high temperature spreads probability across several acceptable candidates.
+
+\subsection{Soft Imitation Loss}
+
+For a deterministic Mamba policy, use weighted regression:
+
+\[
+\mathcal{L}_{soft}
+=
+\sum_{k=1}^{K}
+w_k
+\left\|
+\hat{u}_t - u_t^{(k)}
+\right\|_2^2
+\]
+
+This pulls the prediction toward the center of the high-quality action region. A more advanced option is to make the policy distributional:
+
+\begin{lstlisting}
+policy output = action mean and covariance
+\end{lstlisting}
+
+That would let the network represent narrow safe-action regions near constraints and wider safe-action regions in easier states.
+
+\subsection{Expected Benefits}
+
+Soft action targets may improve:
+
+\begin{itemize}
+  \item smoothness of learned control;
+  \item robustness to small state-estimation errors;
+  \item generalization around unseen states;
+  \item safety near constraints;
+  \item sample efficiency, because each MPC query produces multiple candidate labels.
+\end{itemize}
+
+This is the closest analogue to AlphaGo's ``more bits per sample'' training signal.
+
+\section{Combined Training Loop}
+
+The value head and soft target idea can be combined:
+
+\begin{lstlisting}
+1. Roll out Mamba.
+2. Predict STL robustness using the value head.
+3. Select risky states or trajectories.
+4. Query MPC at those states.
+5. Sample candidate actions around the MPC action.
+6. Score candidates using short-horizon cost or STL margin.
+7. Train on both:
+   - soft action targets
+   - robustness/value targets
+\end{lstlisting}
+
+The value head answers:
+
+\begin{quote}
+Which states or trajectories need attention?
+\end{quote}
+
+The soft target distribution answers:
+
+\begin{quote}
+Which nearby actions are safe or high quality?
+\end{quote}
+
+\section{Recommended Implementation Order}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.22\linewidth}p{0.49\linewidth}p{0.17\linewidth}}
+\toprule
+Phase & Description & Risk \\
+\midrule
+1 & Validate the current MPC, STL, imitation, CEGIS, and baseline comparison pipeline. & Required \\
+2 & Add an STL robustness value head to Mamba and baselines. & Medium \\
+3 & Use the value head to prioritize CEGIS candidates. & Medium \\
+4 & Add soft MPC target distributions around expert actions. & Higher \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The safest first contribution is the STL value head because the label already exists. The most original second-stage contribution is the soft MPC target distribution.
+
+\section{What Should Not Be Claimed}
+
+The project should not claim that drone control needs literal MCTS. That would be an overextension.
+
+Reasons:
+
+\begin{itemize}
+  \item quadrotor control has continuous actions;
+  \item MPC is already the standard planning/control tool for this domain;
+  \item tree search over continuous thrust vectors would be expensive and less natural;
+  \item safety claims should remain tied to MPC, Safe-Control-Gym, and STL robustness.
+\end{itemize}
+
+The appropriate claim is:
+
+\begin{quote}
+We borrow AlphaGo's improvement-distillation pattern: an expensive optimizer/verifier produces richer supervision, and a neural controller distills that supervision into fast inference.
+\end{quote}
+
+\section{Proposed Writeup Paragraph}
+
+Inspired by AlphaGo's separation between fast neural intuition and slower search-based improvement, this project treats MPC and STL falsification as the improvement mechanism for quadrotor control. MPC provides high-quality expert actions, while STL robustness evaluates whether complete trajectories satisfy formal safety and task requirements. The Mamba controller then amortizes this expensive procedure into a fast policy. As an extension, a value head can be trained to predict STL robustness, analogous to AlphaGo's value network, and can be used to prioritize counterexamples during CEGIS. A further extension is to replace single-action MPC imitation with soft local action distributions around the MPC action, allowing the controller to learn the landscape of safe actions rather than only one expert point.
+
+\section{Summary}
+
+\begin{center}
+\begin{tabular}{>{\bfseries}p{0.22\linewidth}p{0.25\linewidth}p{0.31\linewidth}p{0.10\linewidth}}
+\toprule
+Idea & AlphaGo analogy & NNCS-Mamba version & Risk \\
+\midrule
+MPC imitation & Policy learns from improved search & Mamba imitates MPC actions & Low \\
+STL value head & Value network predicts win probability & Value head predicts STL robustness & Medium \\
+Value-guided CEGIS & Value focuses search & Predicted robustness prioritizes failures & Medium \\
+Soft action targets & Train on MCTS visit distribution & Train on scored action samples around MPC & Higher \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
