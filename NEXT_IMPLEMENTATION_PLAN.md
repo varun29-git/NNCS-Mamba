@@ -25,19 +25,43 @@ expensive improvement procedure -> richer supervision -> fast neural controller
 For this project:
 
 ```text
-MPC + STL falsification -> expert/corrective supervision -> Mamba/MLP/GRU controller
+MPC + STL falsification -> expert/corrective supervision -> dual-head Mamba controller
 ```
 
-The implementation should eventually include:
+The implementation should focus first on the core architecture:
 
-- MPC imitation learning.
-- STL robustness evaluation.
-- CEGIS retraining from negative-STL counterexamples.
-- MLP and GRU baselines.
-- Mamba controller.
-- STL value head for robustness prediction.
-- Optional value-guided CEGIS prioritization.
-- Optional soft MPC target distributions around the MPC action.
+- MPC expert trajectory collection.
+- Quantitative STL robustness labels for complete rollouts.
+- A shared Mamba sequence encoder over state/action history.
+- An action/control head that predicts the next 4D quadrotor control action.
+- An STL value head that predicts trajectory robustness or safety margin.
+- Cached online inference so deployment uses fixed-cost per-step control updates.
+- STL-guided CEGIS retraining from negative-robustness counterexamples.
+
+MLP and GRU baselines are still useful, but they should not drive the rebuild. They are comparison models to add after the core dual-head Mamba pipeline works.
+
+## Core Architecture Target
+
+The target controller is:
+
+```text
+historical trajectory window
+    -> shared Mamba sequence encoder
+        -> action/control head: 4D control action
+        -> STL value head: predicted STL robustness / safety margin
+```
+
+Use `action head` or `control head` in implementation and project documentation. The action head is analogous to AlphaGo's policy head, but this project is a continuous-control NNCS, so the control terminology is clearer.
+
+The learned STL value head is not the mathematical verifier. It is a learned judge/predictor used for robustness awareness and later CEGIS prioritization. The actual STL monitor in `stl_monitor.py` remains the authority for safety/task satisfaction.
+
+The deployed controller must expose an online API:
+
+```text
+action, value, cache = controller.step(obs, cache)
+```
+
+For a fixed model size, this API must avoid reprocessing the full history at every control step. The implementation should benchmark mean, p95, and p99 per-step latency and report whether cached Mamba inference is fixed-cost per step.
 
 ## Files to Preserve
 
@@ -59,8 +83,6 @@ docs/ALPHAGO_IDEAS_FOR_NNCS.md
 docs/ALPHAGO_IDEAS_FOR_NNCS.tex
 docs/ALPHAGO_IDEAS_FOR_NNCS.pdf
 ```
-
-## Implementation Order
 
 ## Current Local Status
 
