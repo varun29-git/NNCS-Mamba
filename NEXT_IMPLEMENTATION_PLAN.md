@@ -35,7 +35,7 @@ The implementation should focus first on the core architecture:
 - A shared Mamba sequence encoder over state/action history.
 - An action/control head that predicts the next 4D quadrotor control action.
 - An STL value head that predicts trajectory robustness or safety margin.
-- Cached online inference so deployment uses fixed-cost per-step control updates.
+- Cached online inference so deployment uses constant-time `O(1)` per-step control updates for a fixed model size.
 - STL-guided CEGIS retraining from negative-robustness counterexamples.
 
 MLP and GRU baselines are still useful, but they should not drive the rebuild. They are comparison models to add after the core dual-head Mamba pipeline works.
@@ -61,7 +61,7 @@ The deployed controller must expose an online API:
 action, value, cache = controller.step(obs, cache)
 ```
 
-For a fixed model size, this API must avoid reprocessing the full history at every control step. The implementation should benchmark mean, p95, and p99 per-step latency and report whether cached Mamba inference is fixed-cost per step.
+For a fixed model size, this API must avoid reprocessing the full history at every control step. The implementation should benchmark mean, p95, and p99 per-step latency and report whether cached Mamba inference is fixed-cost, `O(1)` per step.
 
 ## Files to Preserve
 
@@ -121,6 +121,8 @@ Next environment task:
 .venv/bin/python verify_stl_on_expert.py --rollouts 3 --steps 100
 ```
 
+## Implementation Order
+
 ### Step 1: Verify Safe-Control-Gym Interface
 
 Create:
@@ -166,7 +168,7 @@ Acceptance criteria:
 - Positive/negative robustness values are explainable.
 - Component scores identify the limiting requirement.
 
-### Step 3: Expert Dataset Collection
+### Step 3: Expert Dataset Collection With STL Labels
 
 Create:
 
@@ -178,16 +180,24 @@ Purpose:
 
 - Collect MPC demonstrations from Safe-Control-Gym.
 - Store trajectories in a simple format.
-- Save both state/action arrays and metadata.
+- Evaluate each trajectory with `evaluate_stabilization_stl`.
+- Save state/action arrays, STL labels, and benchmark metadata.
 
 Minimum saved fields:
 
 ```text
 states
 actions
+sample_time_sec
+initial_state
 goal_position
 action_low
 action_high
+stl_robustness
+stl_satisfied
+component_robustness
+total_reward
+done
 safe_control_gym_config
 mpc_config
 seed
@@ -197,164 +207,85 @@ Acceptance criteria:
 
 - Dataset can be loaded independently.
 - Shapes are documented.
+- STL labels can be reproduced by rerunning `stl_monitor.py` on saved states/actions.
 - A small dataset can be inspected by hand.
 
-### Step 4: Minimal MLP Baseline
+### Step 4: Controller Interface And Rollout Contracts
 
 Create:
 
 ```text
-models/mlp.py
+models/controller.py
+rollout.py
 ```
 
 Purpose:
 
-- Implement a simple memoryless MLP.
-- Input: current observation/state.
-- Output: action.
-- Train using supervised MPC action imitation.
+- Define the contract shared by training, evaluation, and deployment.
+- Support full-sequence training calls and cached online control calls.
+- Keep environment rollout logic separate from model architecture.
+- Standardize action scaling/clipping and value-head output naming.
 
-Acceptance criteria:
-
-- Code is short and reviewable.
-- Uses AdamW only.
-- No auxiliary losses initially.
-- Can overfit a tiny dataset as a sanity check.
-
-### Step 5: Minimal Training Script
-
-Create:
+Required controller API:
 
 ```text
-train_imitation.py
+controller.forward_sequence(states) -> action_pred, value_pred
+controller.initial_cache(batch_size) -> cache
+controller.step(obs, cache) -> action, value, cache
 ```
-
-Purpose:
-
-- Load expert dataset.
-- Train one selected model.
-- Save checkpoint and metadata.
-- Report train/validation action MSE.
 
 Acceptance criteria:
 
-- Works first for MLP only.
-- No CEGIS yet.
-- No value head yet.
-- No soft targets yet.
+- A dummy controller can be rolled out through the evaluation path.
+- `step` has stable input/output shapes for single-env deployment.
+- The API makes cached inference explicit before Mamba is implemented.
+- No model-specific logic is embedded in the Safe-Control-Gym wrappers.
 
-### Step 6: Evaluation Script
-
-Create:
-
-```text
-evaluate_controller.py
-```
-
-Purpose:
-
-- Load a trained controller.
-- Roll it out in Safe-Control-Gym.
-- Compare against MPC actions when needed.
-- Compute STL robustness and task metrics.
-
-Metrics:
-
-- action MSE/MAE versus MPC;
-- final distance to goal;
-- minimum distance to goal;
-- STL satisfaction rate;
-- average STL robustness;
-- component robustness values;
-- inference time per step.
-
-Acceptance criteria:
-
-- Same evaluation script can evaluate MPC expert and learned controllers.
-- Results are saved as JSON/CSV.
-
-### Step 7: GRU Baseline
-
-Create:
-
-```text
-models/gru.py
-```
-
-Purpose:
-
-- Implement a small recurrent baseline.
-- Use the same dataset, splits, and metrics as MLP.
-
-Acceptance criteria:
-
-- Parameter count is reported.
-- Same training/evaluation interface as MLP.
-- No special tricks beyond what is documented.
-
-### Step 8: Mamba Controller
+### Step 5: Dual-Head Mamba Core
 
 Create:
 
 ```text
 models/mamba.py
+models/heads.py
 ```
 
 Purpose:
 
-- Implement or wrap a reviewable Mamba-style sequence controller.
-- Keep the architecture as simple as possible.
-- Match the same interface as MLP/GRU.
+- Implement or wrap a reviewable Mamba/structured-SSM sequence encoder.
+- Add an action/control head for 4D quadrotor actions.
+- Add an STL value head for predicted robustness or safety margin.
+- Support both sequence training and cached online inference.
 
 Acceptance criteria:
 
 - Each architectural choice is documented.
-- Parameter count is comparable to baselines.
-- Same dataset and evaluation process.
+- Parameter count is reported.
+- `forward_sequence` runs on batched trajectories.
+- Repeated `step` calls are tested against sequence-mode outputs where practical.
+- Cached `step` does not reprocess the full history at every control step.
+- Mean, p95, and p99 per-step inference latency are reported.
 
-### Step 9: CEGIS Loop
+### Step 6: Core Dual-Head Training
 
 Create:
 
 ```text
-cegis.py
+train_mamba.py
 ```
 
 Purpose:
 
-- Roll out the current learner.
-- Use STL robustness to find failed trajectories.
-- Treat negative-STL rollouts as counterexamples.
-- Relabel failed initial states or failure regions with MPC.
-- Add corrected data to the dataset.
-- Retrain.
-
-Acceptance criteria:
-
-- Clearly separates:
-  - epoch;
-  - CEGIS iteration;
-  - expert-labeled sample count.
-- Saves each CEGIS iteration result.
-- Reports STL improvement across iterations.
-
-### Step 10: STL Value Head
-
-Create or extend:
-
-```text
-models/value_heads.py
-```
-
-Purpose:
-
-- Add a value head that predicts STL robustness.
-- Start with total STL robustness only.
-- Later support component robustness prediction.
+- Load the expert dataset with STL labels.
+- Train the Mamba action/control head to imitate MPC actions.
+- Train the STL value head to predict robustness.
+- Save checkpoints and metadata.
+- Keep the first version free of CEGIS, soft targets, uncertainty, and baseline comparisons.
 
 Training target:
 
 ```text
+action_target = MPC action
 value_target = trajectory STL robustness
 ```
 
@@ -364,13 +295,87 @@ Loss:
 L_total = L_action + lambda_value * L_value
 ```
 
+Preferred first losses:
+
+```text
+L_action = MSE(action_pred, action_target)
+L_value = Huber(value_pred, stl_robustness)
+```
+
+The first implementation may attach the same trajectory-level robustness label to every timestep/window. A later refinement can train prefix-conditioned or component-wise value targets.
+
 Acceptance criteria:
 
+- Can overfit a tiny dataset as a sanity check.
+- Reports train/validation action MSE and MAE.
 - Reports robustness prediction MAE.
-- Reports safe/unsafe classification quality.
-- Does not replace the STL monitor.
+- Reports safe/unsafe classification quality from `value_pred >= 0`.
+- Saves model config, dataset manifest, loss weights, and benchmark metadata.
 
-### Step 11: Value-Guided CEGIS Prioritization
+### Step 7: Core Evaluation Script
+
+Create:
+
+```text
+evaluate_controller.py
+```
+
+Purpose:
+
+- Load a trained Mamba controller.
+- Roll it out in Safe-Control-Gym using the cached `step` API.
+- Compare actions against MPC when needed.
+- Compute STL robustness and task metrics.
+- Measure whether the value head predicts STL outcomes reliably.
+
+Metrics:
+
+- action MSE/MAE versus MPC;
+- final distance to goal;
+- minimum distance to goal;
+- STL satisfaction rate;
+- average STL robustness;
+- component robustness values;
+- robustness prediction MAE;
+- value-head violation detection AUROC if both safe and unsafe examples exist;
+- mean, p95, and p99 inference time per step;
+- parameter count and checkpoint size.
+
+Acceptance criteria:
+
+- Evaluation can compare MPC expert and learned Mamba rollouts.
+- Results are saved as JSON/CSV.
+- The reported safety decision always comes from the STL monitor, not from the value head alone.
+
+### Step 8: STL-Guided CEGIS Correction Loop
+
+Create:
+
+```text
+cegis.py
+```
+
+Purpose:
+
+- Roll out the current Mamba controller.
+- Use the STL monitor to find negative-robustness trajectories.
+- Treat negative-STL rollouts as counterexamples.
+- Relabel failed initial states or failure regions with MPC.
+- Add corrected trajectories and STL labels to the dataset.
+- Retrain the dual-head Mamba model.
+
+Acceptance criteria:
+
+- Clearly separates:
+  - epoch;
+  - CEGIS iteration;
+  - expert-labeled sample count.
+- Saves each CEGIS iteration result.
+- Reports STL improvement across iterations.
+- Tracks how many MPC relabeling calls were required.
+- Keeps the STL monitor as the final counterexample authority.
+
+### Step 9: Value-Guided CEGIS Prioritization
 
 Extend:
 
@@ -399,8 +404,31 @@ Acceptance criteria:
 - Compare against random CEGIS selection.
 - Measure counterexamples found per rollout.
 - Measure MPC relabeling calls needed per improvement.
+- Confirm that prioritized candidates are still checked by the real STL monitor.
 
-### Step 12: Soft MPC Target Distributions
+### Step 10: Minimal Baselines For Comparison
+
+Create:
+
+```text
+models/mlp.py
+models/gru.py
+```
+
+Purpose:
+
+- Add small MLP and GRU baselines only after the core Mamba pipeline works.
+- Use the same dataset, splits, rollout logic, STL monitor, and evaluation metrics.
+- Keep baseline implementations simple enough to defend.
+
+Acceptance criteria:
+
+- Parameter counts are reported.
+- Same controller API as Mamba where possible.
+- No special tricks beyond what is documented.
+- Baselines are used for comparison, not as the main implementation spine.
+
+### Step 11: Soft MPC Target Distributions
 
 Create:
 
@@ -413,7 +441,7 @@ Purpose:
 - Around each MPC action, sample candidate actions.
 - Score candidates with short-horizon cost or STL-inspired safety margin.
 - Convert scores into soft weights.
-- Train the policy on weighted action targets.
+- Train the action/control head on weighted action targets.
 
 Candidate generation:
 
@@ -435,14 +463,20 @@ Acceptance criteria:
 
 ## Final Experiment Structure
 
-The final research comparison should include:
+The core experiment should include:
+
+```text
+Mamba action/control head only
+Dual-head Mamba: action/control head + STL value head
+Dual-head Mamba + STL-guided CEGIS
+Dual-head Mamba + value-guided CEGIS
+```
+
+Later comparison experiments may add:
 
 ```text
 MLP
 GRU
-Mamba
-Mamba + STL value head
-Mamba + STL value head + value-guided CEGIS
 Mamba + soft MPC targets
 ```
 
@@ -451,20 +485,20 @@ All models must use:
 - same Safe-Control-Gym environment;
 - same MPC expert;
 - same train/validation/test split;
-- comparable parameter budgets;
+- comparable parameter budgets where practical;
 - same STL monitor;
 - same evaluation seeds;
 - same disturbance/robustness profiles.
 
 ## Do Not Implement Yet
 
-Do not add the following until the basic pipeline is verified:
+Do not add the following until the core dual-head Mamba pipeline is verified:
 
-- value-guided CEGIS;
 - soft MPC targets;
 - uncertainty estimation;
 - distributional action policies;
 - custom docking task;
-- custom quadrotor dynamics.
+- custom quadrotor dynamics;
+- heavy baseline sweeps.
 
-The first priority is a simple, defensible MPC imitation pipeline with STL evaluation.
+The first priority is a simple, defensible dual-head Mamba controller with STL-labeled expert data, cached online inference, and STL-monitor evaluation.
