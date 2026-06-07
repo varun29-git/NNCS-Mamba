@@ -95,6 +95,7 @@ Completed in the rebuild process:
 - Confirmed `tests/test_stl_monitor.py` passes in `.venv`.
 - Added `verify_safe_control_gym.py`.
 - Added `verify_stl_on_expert.py`.
+- Added `dataset.py` for MPC expert trajectory collection with STL labels.
 
 Current local blocker:
 
