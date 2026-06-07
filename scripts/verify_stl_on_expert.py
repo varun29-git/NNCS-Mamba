@@ -5,10 +5,15 @@ from __future__ import annotations
 import argparse
 from importlib.util import find_spec
 from pathlib import Path
+import sys
 
 import numpy as np
 
-from safe_control_gym_config import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from nncs_mamba.safe_control_gym_config import (
     action_bounds,
     clip_to_env_action_space,
     get_goal_position,
@@ -16,7 +21,7 @@ from safe_control_gym_config import (
     reset_gym_env,
     step_gym_env,
 )
-from stl_monitor import STLSpec, evaluate_stabilization_stl
+from nncs_mamba.stl_monitor import STLSpec, evaluate_stabilization_stl
 
 
 def require_runtime_dependencies() -> None:

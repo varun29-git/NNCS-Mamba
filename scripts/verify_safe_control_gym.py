@@ -9,10 +9,15 @@ from __future__ import annotations
 import argparse
 from importlib.util import find_spec
 from pathlib import Path
+import sys
 
 import numpy as np
 
-from safe_control_gym_config import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from nncs_mamba.safe_control_gym_config import (
     ACTION_LABELS,
     SAFE_CONTROL_GYM_VERSION,
     STATE_LABELS,

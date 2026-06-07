@@ -1,78 +1,84 @@
-# NNCS-Mamba (under development)
+# NNCS-Mamba
 
-This repository trains sequence controllers to imitate an MPC expert on the Safe-Control-Gym 3D quadrotor benchmark.
+This repository is rebuilding a safe neural network control system for the Safe-Control-Gym 3D quadrotor stabilization task.
 
-## Research Hardening Status
+The current focus is the core architecture:
 
-The plant and MPC expert are provided directly by Safe-Control-Gym: https://github.com/learnsyslab/safe-control-gym
-
-## Overview
-- Safe-Control-Gym provides the physics-based 3D quadrotor environment.
-- Safe-Control-Gym MPC generates expert state/action demonstrations.
-- Neural controllers learn to imitate the MPC from trajectory data.
-- `RESEARCH.md` records the state/action semantics, MPC settings, STL specification, and experiment commands.
-
-## Neural Architecture (Mamba) (`mamba_learner.py`)
-- Uses a Mamba block (a selective state‑space model) that maintains a hidden state across time steps.
-- Takes the 12‑D Safe-Control-Gym quadrotor observation and outputs 4D control actions.
-
-## Baseline Controller (`gru_learner.py`)
-- Adds a cuDNN-backed GRU baseline for comparison under the same data and evaluation setup.
-
-## Memoryless Baseline (`mlp_learner.py`)
-- Adds an MLP baseline so Mamba is compared against both memoryless and recurrent neural controllers.
-
-## Optimizer
-- Split optimizer: **Muon** for the linear weight matrices and **AdamW** for all other parameters.
-- Mixed‑precision training with PyTorch AMP.
-- Learning‑rate scheduler reduces the rate when validation loss stops improving.
-
-## Training Pipeline (`train.py`)
-1. **Smoke test** – quick run to verify the model compiles.
-2. **Expert data generation** – collect trajectories from Safe-Control-Gym MPC.
-3. **Imitation learning** – train Mamba or GRU on expert trajectories.
-4. **CEGIS refinement** – identify negative-STL learner rollouts, label those initial states with MPC, and retrain.
-
-## Evaluation (`evaluate.py`)
-- Loads a saved checkpoint and runs a number of rollouts.
-- Reports return, final position error, action MSE/MAE versus MPC, constraint violations, STL robustness, STL satisfaction rate, and runtime.
-
-## Current Status
-- The project has been simplified to one defensible environment/controller source.
-- Counterexample-guided retraining and formal STL robustness are implemented against Safe-Control-Gym trajectories.
-
-## How to Run
-```bash
-# Clone the repository
-git clone https://github.com/varun29-git/NNCS-Mamba.git
-cd NNCS-Mamba
-
-# Install dependencies (requires a CUDA‑enabled machine)
-pip install -r requirements.txt
-
-# Research-grade plant/MPC dependency
-git clone https://github.com/learnsyslab/safe-control-gym.git
-cd safe-control-gym
-python -m pip install -e .
-cd ../NNCS-Mamba
-
-# Train on Safe-Control-Gym quadrotor MPC demonstrations
-python train.py --phase imitation --epochs 10
-
-# Evaluate on the same Safe-Control-Gym physics plant
-python evaluate.py --checkpoint runs/experiment/best_imitation.pt
-
-# Baselines
-python train.py --phase imitation --controller mlp --profile mlp-baseline --outdir runs/mlp_baseline
-python train.py --phase imitation --controller gru --profile t4-sota --outdir runs/gru_baseline
-
-# CEGIS ablation
-python train.py --phase all --resume runs/experiment/best_imitation.pt --outdir runs/cegis
-
-# Research sweeps
-python research_experiments.py compare
-python research_experiments.py sample-efficiency
-python research_experiments.py robustness --checkpoint runs/experiment/best_imitation.pt
+```text
+MPC expert trajectories
+    -> STL robustness labels
+    -> dual-head Mamba controller
+        -> action/control head
+        -> STL value head
 ```
 
-Feel free to open issues or pull requests as the project evolves.
+The learned value head predicts robustness. The STL monitor remains the actual safety evaluator.
+
+## Repository Layout
+
+```text
+nncs_mamba/        Core Python package.
+scripts/           Command-line verification and dataset collection scripts.
+tests/             Unit tests.
+docs/              Research notes, implementation plan, and reports.
+runs/              Generated datasets and experiment outputs. Ignored by git.
+```
+
+## Current Pipeline
+
+- Safe-Control-Gym provides the quadrotor plant and MPC expert.
+- `nncs_mamba.stl_monitor` computes quantitative STL robustness.
+- `nncs_mamba.dataset` collects MPC trajectories and saves STL-labeled datasets.
+- The first real datasets were generated on the approved CPU VM `tok64`.
+
+## Quick Checks
+
+Run local STL tests:
+
+```bash
+python -m unittest tests/test_stl_monitor.py
+```
+
+Verify the Safe-Control-Gym + MPC boundary when PyBullet is available:
+
+```bash
+python scripts/verify_safe_control_gym.py --steps 5
+```
+
+Evaluate STL robustness on MPC expert rollouts:
+
+```bash
+python scripts/verify_stl_on_expert.py --rollouts 3 --steps 100
+```
+
+Collect a small expert dataset:
+
+```bash
+python scripts/collect_dataset.py --rollouts 10 --steps 300 --output-dir runs/expert_dataset_tiny
+```
+
+## Generated Datasets
+
+The generated dataset files are ignored by git and live under `runs/`.
+
+Current local artifacts:
+
+```text
+runs/expert_dataset_tiny_tok64/
+runs/expert_dataset_core_tok64/
+```
+
+The core dataset has:
+
+```text
+states:  (240, 301, 12)
+actions: (240, 300, 4)
+STL satisfaction rate: 1.0
+```
+
+## Research Docs
+
+- [Research Configuration](docs/RESEARCH.md)
+- [Next Implementation Plan](docs/NEXT_IMPLEMENTATION_PLAN.md)
+- [AlphaGo Pattern](docs/ALPHAGO_PATTERN_FOR_NNCS.md)
+- [Quadrotor Basics](docs/notes/Quadrator_Basics.md)

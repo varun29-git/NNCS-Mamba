@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List
 
 import numpy as np
 
-from safe_control_gym_config import (
+from nncs_mamba.safe_control_gym_config import (
     ACTION_LABELS,
     SAFE_CONTROL_GYM_MPC_CONFIG,
     SAFE_CONTROL_GYM_TASK_CONFIG,
@@ -35,7 +35,7 @@ from safe_control_gym_config import (
     reset_gym_env,
     step_gym_env,
 )
-from stl_monitor import STLSpec, evaluate_stabilization_stl
+from nncs_mamba.stl_monitor import STLSpec, evaluate_stabilization_stl
 
 
 COMPONENT_ROBUSTNESS_KEYS = (

@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from stl_monitor import STLSpec, evaluate_stabilization_stl
+from nncs_mamba.stl_monitor import STLSpec, evaluate_stabilization_stl
 
 
 class TestSTLMonitor(unittest.TestCase):

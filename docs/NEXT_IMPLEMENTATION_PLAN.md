@@ -53,7 +53,7 @@ historical trajectory window
 
 Use `action head` or `control head` in implementation and project documentation. The action head is analogous to AlphaGo's policy head, but this project is a continuous-control NNCS, so the control terminology is clearer.
 
-The learned STL value head is not the mathematical verifier. It is a learned judge/predictor used for robustness awareness and later CEGIS prioritization. The actual STL monitor in `stl_monitor.py` remains the authority for safety/task satisfaction.
+The learned STL value head is not the mathematical verifier. It is a learned judge/predictor used for robustness awareness and later CEGIS prioritization. The actual STL monitor in `nncs_mamba/stl_monitor.py` remains the authority for safety/task satisfaction.
 
 The deployed controller must expose an online API:
 
@@ -68,15 +68,15 @@ For a fixed model size, this API must avoid reprocessing the full history at eve
 These files are the trusted/current foundation:
 
 ```text
-safe_control_gym_config.py
-stl_monitor.py
+nncs_mamba/safe_control_gym_config.py
+nncs_mamba/stl_monitor.py
 tests/test_stl_monitor.py
 tests/__init__.py
 README.md
-RESEARCH.md
+docs/RESEARCH.md
 requirements.txt
-ALPHAGO_PATTERN_FOR_NNCS.md
-AlphaGo_Architecture_Course.pdf
+docs/ALPHAGO_PATTERN_FOR_NNCS.md
+docs/reference/AlphaGo_Architecture_Course.pdf
 docs/STL_Monitor_Report.tex
 docs/STL_Monitor_Report.pdf
 docs/ALPHAGO_IDEAS_FOR_NNCS.md
@@ -93,9 +93,12 @@ Completed in the rebuild process:
 - Installed the non-PyBullet foundation dependencies.
 - Installed the pinned Safe-Control-Gym package with `--no-deps` to avoid the old Torch dependency conflict.
 - Confirmed `tests/test_stl_monitor.py` passes in `.venv`.
-- Added `verify_safe_control_gym.py`.
-- Added `verify_stl_on_expert.py`.
-- Added `dataset.py` for MPC expert trajectory collection with STL labels.
+- Added `scripts/verify_safe_control_gym.py`.
+- Added `scripts/verify_stl_on_expert.py`.
+- Added `nncs_mamba/dataset.py` and `scripts/collect_dataset.py` for MPC expert trajectory collection with STL labels.
+- Generated real MPC expert datasets on the approved CPU VM `tok64`:
+  - `runs/expert_dataset_tiny_tok64`: 10 rollouts, 300 steps each.
+  - `runs/expert_dataset_core_tok64`: 240 rollouts, 300 steps each.
 
 Current local blocker:
 
@@ -118,8 +121,8 @@ Next environment task:
 - Then rerun:
 
 ```text
-.venv/bin/python verify_safe_control_gym.py --steps 5
-.venv/bin/python verify_stl_on_expert.py --rollouts 3 --steps 100
+.venv/bin/python scripts/verify_safe_control_gym.py --steps 5
+.venv/bin/python scripts/verify_stl_on_expert.py --rollouts 3 --steps 100
 ```
 
 ## Implementation Order
@@ -129,7 +132,7 @@ Next environment task:
 Create:
 
 ```text
-verify_safe_control_gym.py
+scripts/verify_safe_control_gym.py
 ```
 
 Purpose:
@@ -153,7 +156,7 @@ Acceptance criteria:
 Create:
 
 ```text
-verify_stl_on_expert.py
+scripts/verify_stl_on_expert.py
 ```
 
 Purpose:
@@ -174,7 +177,8 @@ Acceptance criteria:
 Create:
 
 ```text
-dataset.py
+nncs_mamba/dataset.py
+scripts/collect_dataset.py
 ```
 
 Purpose:
@@ -208,7 +212,7 @@ Acceptance criteria:
 
 - Dataset can be loaded independently.
 - Shapes are documented.
-- STL labels can be reproduced by rerunning `stl_monitor.py` on saved states/actions.
+- STL labels can be reproduced by rerunning `nncs_mamba/stl_monitor.py` on saved states/actions.
 - A small dataset can be inspected by hand.
 
 ### Step 4: Controller Interface And Rollout Contracts

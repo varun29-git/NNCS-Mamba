@@ -90,31 +90,22 @@ Robustness uses standard quantitative min/max semantics:
 - `F phi = max_t rho(phi, t)`
 - `phi AND psi = min(rho(phi), rho(psi))`
 
-The implementation lives in `stl_monitor.py`; basic satisfying and violating trajectories are tested in `tests/test_stl_monitor.py`.
+The implementation lives in `nncs_mamba/stl_monitor.py`; basic satisfying and violating trajectories are tested in `tests/test_stl_monitor.py`.
 
 ## Experiment Commands
 
-Compare MLP, GRU, and Mamba:
+The current verified commands are:
 
 ```bash
-python research_experiments.py compare --num-traj 1024 --epochs 8 --missions 20
+python scripts/verify_safe_control_gym.py --steps 5
+python scripts/verify_stl_on_expert.py --rollouts 3 --steps 100
+python scripts/collect_dataset.py --rollouts 10 --steps 300 --output-dir runs/expert_dataset_tiny
 ```
 
-Sample-efficiency sweep:
+Future comparison commands will be added after the dual-head Mamba controller is implemented:
 
 ```bash
-python research_experiments.py sample-efficiency --sample-counts 128 512 2048
-```
-
-Robustness sweep:
-
-```bash
-python research_experiments.py robustness --checkpoint runs/experiment/best_imitation.pt
-```
-
-CEGIS ablation:
-
-```bash
-python train.py --phase imitation --outdir runs/imitation
-python train.py --phase all --resume runs/imitation/best_imitation.pt --outdir runs/cegis
+python train_mamba.py --dataset runs/expert_dataset_core_tok64/expert_dataset_core_tok64.npz
+python evaluate_controller.py --checkpoint runs/mamba/best.pt
+python cegis.py --checkpoint runs/mamba/best.pt
 ```

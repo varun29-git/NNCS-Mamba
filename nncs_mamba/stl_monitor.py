@@ -4,7 +4,7 @@ from typing import Dict, Optional
 
 import numpy as np
 
-from safe_control_gym_config import state_angles, state_position, state_velocity
+from nncs_mamba.safe_control_gym_config import state_angles, state_position, state_velocity
 
 
 @dataclass(frozen=True)

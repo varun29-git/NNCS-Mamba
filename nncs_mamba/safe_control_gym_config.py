@@ -159,8 +159,8 @@ def make_env_and_mpc(output_dir: str, seed: int, task_config: Dict[str, Any] | N
     mpc = make(
         "mpc",
         env_func,
-        training=False,
         output_dir=output_dir,
+        use_gpu=False,
         seed=seed,
         **SAFE_CONTROL_GYM_MPC_CONFIG,
     )
