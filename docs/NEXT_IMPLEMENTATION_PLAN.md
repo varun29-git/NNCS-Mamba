@@ -99,6 +99,9 @@ Completed in the rebuild process:
 - Generated real MPC expert datasets on the approved CPU VM `tok64`:
   - `runs/expert_dataset_tiny_tok64`: 10 rollouts, 300 steps each.
   - `runs/expert_dataset_core_tok64`: 240 rollouts, 300 steps each.
+- Added `nncs_mamba/models/controller.py` for the shared action/control head plus STL value head contract.
+- Added `nncs_mamba/rollout.py` for model-independent controller rollouts through an environment.
+- Added `tests/test_controller_contract.py` to validate controller shapes, cached stepping, action clipping, value logging, and early stopping without PyBullet.
 
 Current local blocker:
 
@@ -220,8 +223,9 @@ Acceptance criteria:
 Create:
 
 ```text
-models/controller.py
-rollout.py
+nncs_mamba/models/controller.py
+nncs_mamba/rollout.py
+tests/test_controller_contract.py
 ```
 
 Purpose:
@@ -245,6 +249,13 @@ Acceptance criteria:
 - `step` has stable input/output shapes for single-env deployment.
 - The API makes cached inference explicit before Mamba is implemented.
 - No model-specific logic is embedded in the Safe-Control-Gym wrappers.
+
+Status:
+
+- Implemented a NumPy-only `ConstantController` to test the pipeline before the neural model exists.
+- Standardized `controller.forward_sequence(states) -> action_pred, value_pred`.
+- Standardized `controller.step(obs, cache) -> action, value, cache`.
+- Implemented rollout recording for states, clipped actions, predicted STL values, rewards, done flags, and final info.
 
 ### Step 5: Dual-Head Mamba Core
 

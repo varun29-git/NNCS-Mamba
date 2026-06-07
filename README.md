@@ -29,6 +29,8 @@ runs/              Generated datasets and experiment outputs. Ignored by git.
 - Safe-Control-Gym provides the quadrotor plant and MPC expert.
 - `nncs_mamba.stl_monitor` computes quantitative STL robustness.
 - `nncs_mamba.dataset` collects MPC trajectories and saves STL-labeled datasets.
+- `nncs_mamba.models.controller` defines the action/control head plus STL value head interface.
+- `nncs_mamba.rollout` evaluates any controller through the same environment loop.
 - The first real datasets were generated on the approved CPU VM `tok64`.
 
 ## Quick Checks
@@ -36,7 +38,7 @@ runs/              Generated datasets and experiment outputs. Ignored by git.
 Run local STL tests:
 
 ```bash
-python -m unittest tests/test_stl_monitor.py
+python -m unittest
 ```
 
 Verify the Safe-Control-Gym + MPC boundary when PyBullet is available:
