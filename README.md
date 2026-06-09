@@ -30,8 +30,15 @@ runs/              Generated datasets and experiment outputs. Ignored by git.
 - `nncs_mamba.stl_monitor` computes quantitative STL robustness.
 - `nncs_mamba.dataset` collects MPC trajectories and saves STL-labeled datasets.
 - `nncs_mamba.models.controller` defines the action/control head plus STL value head interface.
+- `nncs_mamba.models.mamba` implements the first dual-head structured-SSM controller core.
+- `nncs_mamba.training` trains the dual-head controller from MPC actions and STL robustness labels.
 - `nncs_mamba.rollout` evaluates any controller through the same environment loop.
 - The first real datasets were generated on the approved CPU VM `tok64`.
+- The first 1M-parameter model was trained on an AWS `g6e.xlarge` L40S GPU.
+
+The model files require PyTorch. The simulator foundation is kept separate
+because Safe-Control-Gym pins an older Torch range, while this Python 3.11
+environment uses modern Torch for the neural controller.
 
 ## Quick Checks
 
@@ -59,6 +66,18 @@ Collect a small expert dataset:
 python scripts/collect_dataset.py --rollouts 10 --steps 300 --output-dir runs/expert_dataset_tiny
 ```
 
+Benchmark the controller core on CPU:
+
+```bash
+python scripts/benchmark_mamba_controller.py --steps 1000
+```
+
+Run a small supervised training pass:
+
+```bash
+python scripts/train_mamba.py --epochs 1 --limit-rollouts 8 --device cpu
+```
+
 ## Generated Datasets
 
 The generated dataset files are ignored by git and live under `runs/`.
@@ -68,6 +87,7 @@ Current local artifacts:
 ```text
 runs/expert_dataset_tiny_tok64/
 runs/expert_dataset_core_tok64/
+runs/mamba_l40s_1m/
 ```
 
 The core dataset has:

@@ -102,6 +102,20 @@ Completed in the rebuild process:
 - Added `nncs_mamba/models/controller.py` for the shared action/control head plus STL value head contract.
 - Added `nncs_mamba/rollout.py` for model-independent controller rollouts through an environment.
 - Added `tests/test_controller_contract.py` to validate controller shapes, cached stepping, action clipping, value logging, and early stopping without PyBullet.
+- Added `nncs_mamba/models/heads.py` for the action/control head and STL value head.
+- Added `nncs_mamba/models/mamba.py` for the first dual-head structured-SSM controller core.
+- Added `tests/test_mamba_controller.py` to validate batched sequence inference, cached online inference, gradient flow, and rollout compatibility.
+- Added `scripts/benchmark_mamba_controller.py` to report parameter count and cached-step CPU latency without using Safe-Control-Gym or a GPU.
+- Added `nncs_mamba/training.py` and `scripts/train_mamba.py` for first supervised dual-head training.
+- Ran a local CPU smoke train on 8 rollouts with a 1,034,141-parameter model.
+- Ran a full small GPU train on AWS `g6e.xlarge` with one NVIDIA L40S:
+  - output: `runs/mamba_l40s_1m`
+  - epochs: 10
+  - train windows: 1728
+  - validation windows: 432
+  - best validation loss: `0.00006800415037475802`
+  - final validation action MSE: `0.00007478629305734541`
+  - final validation value MAE: `0.001593289664015174`
 
 Current local blocker:
 
@@ -262,8 +276,10 @@ Status:
 Create:
 
 ```text
-models/mamba.py
-models/heads.py
+nncs_mamba/models/mamba.py
+nncs_mamba/models/heads.py
+tests/test_mamba_controller.py
+scripts/benchmark_mamba_controller.py
 ```
 
 Purpose:
@@ -282,12 +298,27 @@ Acceptance criteria:
 - Cached `step` does not reprocess the full history at every control step.
 - Mean, p95, and p99 per-step inference latency are reported.
 
+Status:
+
+- Implemented the first trainable dual-head structured-SSM controller.
+- The controller exposes `forward_torch` for training with gradients.
+- The controller exposes `forward_sequence` and `step` for the existing NumPy controller contract.
+- The cached `step` path stores one fixed-size state per SSM layer.
+- Tests verify that repeated cached `step` calls match the full-sequence path for the same input history.
+- The benchmark script reports parameter count and cached online latency on CPU.
+
+Important limitation:
+
+- This is the initial reviewable Mamba-style SSM core. It is not trained yet.
+- The next step is to train it on the MPC + STL dataset and then evaluate its closed-loop STL robustness.
+
 ### Step 6: Core Dual-Head Training
 
 Create:
 
 ```text
-train_mamba.py
+nncs_mamba/training.py
+scripts/train_mamba.py
 ```
 
 Purpose:
@@ -327,6 +358,21 @@ Acceptance criteria:
 - Reports robustness prediction MAE.
 - Reports safe/unsafe classification quality from `value_pred >= 0`.
 - Saves model config, dataset manifest, loss weights, and benchmark metadata.
+
+Status:
+
+- Implemented the first supervised trainer.
+- The trainer loads NPZ expert datasets directly.
+- The trainer uses fixed-length trajectory windows.
+- The action/control head learns MPC actions with MSE.
+- The STL value head learns trajectory-level STL robustness with Huber loss.
+- A 1,034,141-parameter model trained successfully on the AWS L40S run in `runs/mamba_l40s_1m`.
+
+Current limitation:
+
+- The value target is still one trajectory-level robustness label repeated across the window.
+- The dataset is all safe in the current core run, so safe/unsafe classification is not meaningful yet.
+- Next we need evaluation rollouts and then counterexample generation to create negative robustness examples.
 
 ### Step 7: Core Evaluation Script
 
